@@ -249,7 +249,8 @@ class TemplateAPI(TemplateLM):
             )
         else:
             # bit of a hack. We'll load back before sending to the API
-            return JsonChatStr(json.dumps(chat_history))
+            # MERA update: need to store cyrillic symbols
+            return JsonChatStr(json.dumps(chat_history, ensure_ascii=False))
 
     @cached_property
     def eot_token_id(self) -> Optional[int]:
