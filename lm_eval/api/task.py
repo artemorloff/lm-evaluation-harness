@@ -28,6 +28,7 @@ from lm_eval import utils
 from lm_eval.api import samplers
 from lm_eval.api.instance import Instance, OutputType
 from lm_eval.api.metrics import bits_per_byte, mean, weighted_perplexity
+from lm_eval.api.model import LM
 from lm_eval.api.registry import (
     AGGREGATION_REGISTRY,
     DEFAULT_METRIC_REGISTRY,
@@ -36,6 +37,7 @@ from lm_eval.api.registry import (
     get_metric_aggregation,
     is_higher_better,
 )
+
 from lm_eval.caching.cache import load_from_cache, save_to_cache
 from lm_eval.filters import build_filter_ensemble
 from lm_eval.prompts import get_prompt
@@ -49,6 +51,11 @@ ALL_OUTPUT_TYPES = [
 ]
 
 eval_logger = logging.getLogger("lm-eval")
+
+
+class TruncationError(Exception):
+    def __init__(self, content):
+        self.content = content
 
 
 @dataclass
@@ -390,6 +397,8 @@ class Task(abc.ABC):
         fewshot_as_multiturn: bool = False,
         chat_template: Optional[Callable] = None,
         tokenizer_name: str = "",
+        truncation_mode: str = "default_left",
+        lm: "LM" = None,
     ) -> None:
         """Build a set of Instances for a task, and store them in task.instances"""
 
@@ -443,14 +452,23 @@ class Task(abc.ABC):
             total=num_docs,
         ):
             # sample fewshot context #TODO: need to offset doc_id by rank now!
-            fewshot_ctx = self.fewshot_context(
+            # fewshot_ctx is a List
+            fewshot_ctx, first_system = self.fewshot_context(
                 doc,
                 0 if self.config.num_fewshot is None else self.config.num_fewshot,
                 system_instruction,
                 apply_chat_template,
                 fewshot_as_multiturn,
-                chat_template,
             )
+
+            # just add the test sample at the end of the list
+            fewshot_ctx = self.add_test_sample(doc, fewshot_ctx, apply_chat_template, fewshot_as_multiturn)
+
+            # 1. if no template, fewshot_ctx is a list of strings that can be joined with ""
+            # 2. in only chat_template, fewshot_ctx is a list of dicts where the last dict has list of strings 
+            # as content that could be joined with "" to firm the valid request
+            # 3. if multiturn, fewshot_ctx is already a valid list of dicts
+            # 4. if multiple_inputs, fewshot_ctx is a list of lists of something above
 
             # TODO: we should override self.config.repeats if doing greedy gen so users don't waste time+compute
             inst = self.construct_requests(
@@ -461,6 +479,9 @@ class Task(abc.ABC):
 
             if not isinstance(inst, list):
                 inst = [inst]
+            
+            for elem in inst:
+                elem = self.truncate_and_chat_template(elem, lm, chat_template, truncation_mode, first_system)
 
             instances.append(inst)
 
@@ -1008,13 +1029,14 @@ class ConfigurableTask(Task):
         If fewshot_as_multiturn is True, or labeled_examples is empty, or the last entry is a system turn, appends the question as a new user entry.
         Otherwise, it is appended to the last user entry, ensuring that the conversation alternates between the user and the assistant.
         """
+
         if not fewshot_as_multiturn:
             # if no messages or last message is system, append as new user entry
             if len(labeled_examples) == 0 or labeled_examples[-1]["role"] == "system":
                 labeled_examples.append({"role": "user", "content": question})
             # if last message is user, append to it to avoid two user messages in a row
             else:
-                labeled_examples[-1]["content"] += question
+                labeled_examples[-1]["content"].extend([question])
         else:
             # if fewshot_as_multiturn is True, append as next user entry (last is always assistant)
             labeled_examples.append({"role": "user", "content": question})
@@ -1027,7 +1049,6 @@ class ConfigurableTask(Task):
         system_instruction: Optional[str] = None,
         apply_chat_template: bool = False,
         fewshot_as_multiturn: bool = False,
-        chat_template: Optional[Callable] = None,
     ) -> str:
         """Returns a fewshot context string that is made up of a prepended description
         (if provided), the `num_fewshot` number of examples, and an appended prompt example.
@@ -1048,11 +1069,90 @@ class ConfigurableTask(Task):
             The fewshot context.
         """
 
-        if apply_chat_template:
-            labeled_examples = []
-        else:
-            labeled_examples = ""
+        # always make a list of fewshots
+        labeled_examples = []
+        first_system = False
 
+        system_prompt = self.define_system_prompt(doc, system_instruction, apply_chat_template)
+
+        if system_prompt is not None:
+            labeled_examples.extend(system_prompt)
+            first_system = True
+
+        # if few-shot - append examples after the system prompt
+        # fewshots are still a list
+        if num_fewshot > 0:
+            if apply_chat_template:
+                fewshots = self.sampler.get_chat_context(
+                    doc, num_fewshot, fewshot_as_multiturn
+                )
+            else:
+                fewshots = self.sampler.get_context(doc, num_fewshot)
+            labeled_examples.extend(fewshots)
+        
+        return labeled_examples, first_system
+
+    
+    @utils.positional_deprecated
+    def add_test_sample(
+        self,
+        doc: str,
+        labeled_examples: List = [],
+        apply_chat_template: bool = False,
+        fewshot_as_multiturn: bool = False,
+    ):
+        example = self.doc_to_text(doc)
+        if apply_chat_template:
+            if self.multiple_input:
+                return labeled_examples
+            if isinstance(example, str):
+                self.append_target_question(
+                    labeled_examples, example, fewshot_as_multiturn
+                )
+            # for loglikelihood create a list of questions with appended choices
+            elif isinstance(example, list):
+                labeled_examples_list = []
+                # copy chat history for each example and append the answer
+                for ex in example:
+                    chat = deepcopy(labeled_examples)
+                    self.append_target_question(chat, ex, fewshot_as_multiturn)
+                    labeled_examples_list.append([chat])
+                return labeled_examples_list
+            # if example is an integer, append the choice or convert to string
+            elif isinstance(example, int):
+                if self.config.doc_to_choice is not None:
+                    choices = self.doc_to_choice(doc)
+                    self.append_target_question(
+                        labeled_examples, choices[example], fewshot_as_multiturn
+                    )
+                else:
+                    self.append_target_question(
+                        labeled_examples, str(example), fewshot_as_multiturn
+                    )
+            return labeled_examples
+        else:
+            if self.multiple_input:
+                return labeled_examples
+            if isinstance(example, str):
+                return labeled_examples + [example]
+            elif isinstance(example, list):
+                labeled_examples_list = [labeled_examples + [ex] for ex in example]
+                return labeled_examples_list
+            elif isinstance(example, int):
+                if self.config.doc_to_choice is not None:
+                    choices = self.doc_to_choice(doc)
+                    return labeled_examples + [choices[example]]
+                else:
+                    return labeled_examples + [str(example)]
+                
+
+    @utils.positional_deprecated
+    def define_system_prompt(
+        self,
+        doc: str,
+        system_instruction: Optional[str] = None,
+        apply_chat_template: bool = False,
+    ):
         # get task description
         if description := self.config.description:
             description = utils.apply_template(self.config.description, doc)
@@ -1071,65 +1171,192 @@ class ConfigurableTask(Task):
 
         # add system prompt if specified
         if system_prompt:
-            if apply_chat_template:
-                labeled_examples.append({"role": "system", "content": system_prompt})
-            else:
-                labeled_examples = system_prompt
 
-        # if few-shot - append examples after the system prompt
-        if num_fewshot > 0:
+            # add system prompt if specified
             if apply_chat_template:
-                labeled_examples.extend(
-                    self.sampler.get_chat_context(
-                        doc, num_fewshot, fewshot_as_multiturn
-                    )
-                )
-            else:
-                labeled_examples += self.sampler.get_context(doc, num_fewshot)
+                return {"role": "system", "content": system_prompt}
 
-        example = self.doc_to_text(doc)
-        if apply_chat_template:
-            if self.multiple_input:
-                return chat_template(labeled_examples)
-            if isinstance(example, str):
-                self.append_target_question(
-                    labeled_examples, example, fewshot_as_multiturn
-                )
-            # for loglikelihood create a list of questions with appended choices
-            elif isinstance(example, list):
-                labeled_examples_list = []
-                # copy chat history for each example and append the answer
-                for ex in example:
-                    chat = deepcopy(labeled_examples)
-                    self.append_target_question(chat, ex, fewshot_as_multiturn)
-                    labeled_examples_list.append(chat_template(chat))
-                return labeled_examples_list
-            # if example is an integer, append the choice or convert to string
-            elif isinstance(example, int):
-                if self.config.doc_to_choice is not None:
-                    choices = self.doc_to_choice(doc)
-                    self.append_target_question(
-                        labeled_examples, choices[example], fewshot_as_multiturn
-                    )
+            return system_prompt
+        return None
+    
+
+    def truncate_and_chat_template(
+            self,
+            request: Instance = None, 
+            lm: "LM" = None, 
+            chat_template: Optional[Callable] = None, 
+            truncation_mode: str = "default_left",
+            first_system: bool = False,
+        ):
+        tokenizer = getattr(lm, "tokenizer", False)
+
+        reqs = request.arguments
+
+        # 1. if no template, fewshot_ctx is a list of strings that can be joined with ""
+        # 2. in only chat_template, fewshot_ctx is a list of dicts where the last dict has list of strings 
+        # as content that could be joined with "" to firm the valid request
+        # 3. if multiturn, fewshot_ctx is already a valid list of dicts
+        # 4. if multiple_inputs, fewshot_ctx is a list of lists of something above
+
+        # 1. loglikelihood - (ctx, self.doc_to_target(doc))
+        # 2. loglikelihood_rolling - (self.doc_to_target(doc),) +
+        # 3. multiple_choice - (ctx + choice, f"{target_delimiter}{cont}") / (ctx, f"{target_delimiter}{cont}")
+        # 4. generate_until - (ctx, deepcopy(self.config.generation_kwargs))
+        # 5. acc_mutual_info - ("", "{}".format(choice)) +
+
+        # turn no_template fewshot_ctx into List[dict]: {"role": "user", "content": fewshot_ctx[i]}
+
+        exceeds = False
+
+        if tokenizer:
+
+            max_length = lm.max_length
+
+            if len(reqs) == 1:
+                text = reqs[0]
+                # loglikelihood_rolling, do not need tokenizer at all
+                if "symbols" in truncation_mode:
+                    # max_length is max number of symbols in a sequence
+                    # if more than needed - truncate by simple slicing
+                    if len(text) > max_length:
+                        offset = len(text) - max_length
+                        new_text, exceeds = self.symbols_truncation(text, truncation_mode, max_length, offset)
+                        if len(new_text) == 0:
+                            msg = "Cannot truncate the text with the selected strategy `{mode}` - no symbols remain in the text of the request. Try reducing the system instruction (if passed), choose another truncation strategy or increase max_length.".format(mode=truncation_mode)
+                            raise TruncationError(msg)
+                elif "default" in truncation_mode:
+                    tokens = tokenizer.encode(text)
+                    if len(tokens) > max_length:
+                        exceeds = True
+                        # how many symbols to truncate
+                        offset = len(tokens) - max_length
+                        if "left" in truncation_mode:
+                            new_tokens = tokens[offset:]
+                        elif "right" in truncation_mode:
+                            new_tokens = tokens[:-offset]
+                        if len(new_tokens) == 0:
+                            msg = "Cannot truncate the text with the selected strategy `{mode}` - no tokens remain in the text of the request. Try reducing the system instruction (if passed), choose another truncation strategy or increase max_length.".format(mode=truncation_mode)
+                            raise TruncationError(msg)
+                        # decode to get valid strings
+                        # double tokenizetion - one more in model class before passing into model
+                        new_text = tokenizer.batch_decode([new_tokens])[0]
                 else:
-                    self.append_target_question(
-                        labeled_examples, str(example), fewshot_as_multiturn
-                    )
-                # return lm.apply_chat_template(labeled_examples)
-            return chat_template(labeled_examples)
-        else:
-            if self.multiple_input:
-                return labeled_examples
-            if isinstance(example, str):
-                return labeled_examples + example
-            elif isinstance(example, list):
-                return [labeled_examples + ex for ex in example]
-            elif isinstance(example, int):
-                if self.config.doc_to_choice is not None:
-                    choices = self.doc_to_choice(doc)
-                    return labeled_examples + choices[example]
-                else:
-                    return labeled_examples + str(example)
+                    msg = "Passed truncation_mode `{mode}` cannot handle the input data. No truncation applied while building requests"
+                    eval_logger.warning(msg)
+                request.arguments = (new_text,)
+                return request, exceeds
+            # no other option but 1 or 2 elements in reqs
+            else:
+                # acc_mutual_info option
+                if reqs[0] == "":
+                    text = reqs[1]
+                    if "symbols" in truncation_mode:
+                        # max_length is max number of symbols in a sequence
+                        # if more than needed - truncate by simple slicing
+                        if len(text) > max_length:
+                            new_text, 
+                            if len(new_text) == 0:
+                                msg = "Cannot truncate the text with the selected strategy `{mode}` - no symbols remain in the text of the request. Try reducing the system instruction (if passed), choose another truncation strategy or increase max_length.".format(mode=truncation_mode)
+                                raise TruncationError(msg)
+                            request.arguments = (new_text,)
+                    elif "default" in truncation_mode:
+                        tokens = tokenizer.encode(text)
+                        if len(tokens) > max_length:
+                            exceeds = True
+                            # how many symbols to truncate
+                            offset = len(tokens) - max_length
+                            if "left" in truncation_mode:
+                                new_tokens = tokens[offset:]
+                            elif "right" in truncation_mode:
+                                new_tokens = tokens[:-offset]
+                            if len(new_text) == 0:
+                                msg = "Cannot truncate the text with the selected strategy `{mode}` - no tokens remain in the text of the request. Try reducing the system instruction (if passed), choose another truncation strategy or increase max_length.".format(mode=truncation_mode)
+                                raise TruncationError(msg)
+                            # decode to get valid strings
+                            # double tokenizetion - one more in model class before passing into model
+                            request.arguments = ("", tokenizer.batch_decode([new_tokens])[0])
+                    else:
+                        msg = "Passed truncation_mode `{mode}` cannot handle the input data. No truncation applied while building requests".format(mode=truncation_mode)
+                        eval_logger.warning(msg)
+                    return request, exceeds
+                # generate_until
+                elif isinstance(reqs[1], dict):
+                    lst = reqs[0]  # always a list
+                    # no chat_template
+                    if isinstance(lst[0], str):
+                        if "symbols" in truncation_mode:
+                            if first_system:
+                                system = lst[0]
+                                text = "".join(lst[1:])
+                            else:
+                                system = ""
+                                text = "".join(lst)
+
+                            if len(system + text) > max_length:
+                                exceeds = True
+                                # how many symbols to truncate
+                                # do not touch system prompt
+                                offset = len(text) - (max_length - len(system))
+                                if "left" in truncation_mode:
+                                    new_text = text[offset:]
+                                elif "right" in truncation_mode:
+                                    new_text = text[:-offset]
+                                if len(new_text) == 0:
+                                    msg = "Cannot truncate the text with the selected strategy `{mode}` - no symbols remain in the text of the request. Try reducing the system instruction (if passed), choose another truncation strategy or increase max_length.".format(mode=truncation_mode)
+                                    raise TruncationError(msg)
+                                request.arguments = (system + new_text,)
+                        elif "default" in truncation_mode:
+                            tokens = tokenizer.encode(text)
+                            if len(tokens) > max_length:
+                                exceeds = True
+                                # how many symbols to truncate
+                                offset = len(tokens) - max_length
+                                if "left" in truncation_mode:
+                                    new_tokens = tokens[offset:]
+                                elif "right" in truncation_mode:
+                                    new_tokens = tokens[:-offset]
+                                if len(new_text) == 0:
+                                    msg = "Cannot truncate the text with the selected strategy `{mode}` - no tokens remain in the text of the request. Try reducing the system instruction (if passed), choose another truncation strategy or increase max_length.".format(mode=truncation_mode)
+                                    raise TruncationError(msg)
+                                # decode to get valid strings
+                                # double tokenizetion - one more in model class before passing into model
+                                request.arguments = ("", tokenizer.batch_decode([new_tokens])[0])
+                        else:
+                            msg = "Passed truncation_mode `{mode}` cannot handle the input data. No truncation applied while building requests".format(mode=truncation_mode)
+                            eval_logger.warning(msg)
+                        return request, exceeds
+                        
+
+    def symbols_truncation(self, text, truncation_mode, max_length, offset):
+        if len(text) > max_length:
+            if "left" in truncation_mode:
+                new_text = text[offset:]
+            elif "right" in truncation_mode:
+                new_text = text[:-offset]
+            return new_text, True
+        return text, False
+    
+
+    def default_truncate(self, text, tokenizer, truncation_mode, max_length, offset):
+        # add_special_tokens учесть
+        tokens = tokenizer.encode(text)
+        if len(tokens) > max_length:
+            if "left" in truncation_mode:
+                new_tokens = tokens[offset:]
+            elif "right" in truncation_mode:
+                new_tokens = tokens[:-offset]
+
+
+    def transformers_truncation(self, text, tokenizer, truncation_mode, max_length, offset):
+        # add_special_tokens учесть
+        # тут применяется обрезка трансформеров, то есть ставим truncation
+        # сторону считываем из truncation_mode и меняем у токенизатора, потом возвращаем старую
+    
+
+    def join_request_list(request: List[str] = []):
+        joined = "".join(request)
+        return joined
+
 
     def apply_filters(self):
         """Iterates over FilterEnsembles and applies them to instances"""

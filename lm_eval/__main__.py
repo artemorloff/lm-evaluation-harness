@@ -257,6 +257,19 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Sets trust_remote_code to True to execute code to create HF Datasets from the Hub",
     )
+    parser.add_argument(
+        "--truncation_mode",
+        type=str,
+        default="default_left",
+        help=(
+            "The truncation mode. Available options:"
+            "\n`default_left` - classical truncation of all tokens from the left"
+            "\n`default_right` - the same classical truncation of all tokens from the right side"
+            "\n`fewshots_only` - truncate the whole fewshots until sequence fits into context or fails"
+            "\n`user_left` - truncate exclusively user prompt text from the left"
+            "\n`user_right` - truncate exclusively user prompt text from the right"
+        )
+    )
     return parser
 
 
@@ -319,6 +332,11 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         eval_logger.warning(
             " --limit SHOULD ONLY BE USED FOR TESTING."
             "REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT."
+        )
+
+    if args.truncation_mode not in ["default_left", "default_right", "fewshots_only", "user_left", "user_right"]:
+        raise ValueError(
+            "The `--truncation_mode` arguement should be one of ['default_left', 'default_right', 'fewshots_only', 'user_left', 'user_right']"
         )
 
     if args.tasks is None:
@@ -411,6 +429,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         numpy_random_seed=args.seed[1],
         torch_random_seed=args.seed[2],
         fewshot_random_seed=args.seed[3],
+        truncation_mode=args.truncation_mode,
         **request_caching_args,
     )
 

@@ -73,26 +73,28 @@ class ContextSampler:
         # TODO: should we just stop people from using fewshot from same split as evaluating?
         selected_docs = [x for x in fewshotex if x != doc][:num_fewshot]
 
-        labeled_examples = ""
+        labeled_examples = []
         for doc in selected_docs:
+            one_sample = ""
             doc_content = self.doc_to_text(doc)
             doc_target = self.doc_to_target(doc)
-            labeled_examples += (
+            one_sample += (
                 doc_content
                 if self.config.doc_to_choice is None or isinstance(doc_content, str)
                 else self.doc_to_choice(doc)[doc_content]
             )
 
             if doc_target != "":
-                labeled_examples += self.target_delimiter
-                labeled_examples += (
+                one_sample += self.target_delimiter
+                one_sample += (
                     str(doc_target[0])
                     if isinstance(doc_target, list)
                     else doc_target
                     if self.config.doc_to_choice is None or isinstance(doc_target, str)
                     else str(self.doc_to_choice(doc)[doc_target])
                 )
-                labeled_examples += self.fewshot_delimiter
+                one_sample += self.fewshot_delimiter
+            labeled_examples.extend([one_sample])
 
         return labeled_examples
 
