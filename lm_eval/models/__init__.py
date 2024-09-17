@@ -4,6 +4,7 @@ from . import (
     dummy,
     gguf,
     gigachat_model,
+    hf_vlms,
     huggingface,
     mamba_lm,
     nemo_lm,
@@ -13,6 +14,7 @@ from . import (
     optimum_lm,
     textsynth,
     vllm_causallms,
+    vllm_vlms,
 )
 
 
