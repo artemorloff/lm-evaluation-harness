@@ -349,8 +349,8 @@ def simple_evaluate(
         )
         results["git_hash"] = get_git_commit_hash()
         results["date"] = start_date
-        add_env_info(results)  # additional environment info to results
-        add_tokenizer_info(results, lm)  # additional info about tokenizer
+        # add_env_info(results)  # additional environment info to results
+        # add_tokenizer_info(results, lm)  # additional info about tokenizer
         return results
     else:
         return None
