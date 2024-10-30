@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lm_eval"
-version = "0.4.4"
+version = "0.4.5"
 authors = [
     {name="EleutherAI", email="contact@eleuther.ai"}
 ]
@@ -63,6 +63,7 @@ deepsparse = ["deepsparse-nightly[llm]>=1.8.0.20240404"]
 gigachat = ["gigachat", "httpx"]
 gptq = ["auto-gptq[triton]>=0.6.0"]
 hf_transfer = ["hf_transfer"]
+ibm_watsonx_ai = ["ibm_watsonx_ai"]
 ifeval = ["langdetect", "immutabledict", "nltk>=3.9.1"]
 neuronx = ["optimum[neuronx]"]
 mamba = ["mamba_ssm", "causal-conv1d==1.0.2"]
@@ -83,6 +84,7 @@ all = [
     "lm_eval[gptq]",
     "lm_eval[gigachat]",
     "lm_eval[hf_transfer]",
+    "lm_eval[ibm_watsonx_ai]",
     "lm_eval[ifeval]",
     "lm_eval[mamba]",
     "lm_eval[math]",
