@@ -37,7 +37,6 @@ from lm_eval.api.registry import (
     get_metric_aggregation,
     is_higher_better,
 )
-
 from lm_eval.caching.cache import load_from_cache, save_to_cache
 from lm_eval.filters import build_filter_ensemble
 from lm_eval.prompts import get_prompt
@@ -52,11 +51,6 @@ ALL_OUTPUT_TYPES = [
 ]
 
 eval_logger = logging.getLogger("lm-eval")
-
-
-class TruncationError(Exception):
-    def __init__(self, content):
-        self.content = content
 
 
 @dataclass
@@ -460,17 +454,6 @@ class Task(abc.ABC):
                 doc, fewshot_ctx, apply_chat_template, fewshot_as_multiturn
             )
 
-            # just add the test sample at the end of the list
-            fewshot_ctx = self.add_test_sample(
-                doc, fewshot_ctx, apply_chat_template, fewshot_as_multiturn
-            )
-
-            # 1. if no template, fewshot_ctx is a list of strings that can be joined with ""
-            # 2. in only chat_template, fewshot_ctx is a list of dicts where the last dict has list of strings
-            # as content that could be joined with "" to firm the valid request
-            # 3. if multiturn, fewshot_ctx is already a valid list of dicts
-            # 4. if multiple_inputs, fewshot_ctx is a list of lists of something above
-
             # TODO: we should override self.config.repeats if doing greedy gen so users don't waste time+compute
             inst = self.construct_requests(
                 doc=doc,
@@ -480,11 +463,6 @@ class Task(abc.ABC):
 
             if not isinstance(inst, list):
                 inst = [inst]
-
-            for elem in inst:
-                elem = self.truncate_and_chat_template(
-                    elem, lm, chat_template, truncation_mode, first_system
-                )
 
             # TODO: add some notification system here based on returned status
             for elem in inst:
@@ -1042,14 +1020,13 @@ class ConfigurableTask(Task):
         If fewshot_as_multiturn is True, or labeled_examples is empty, or the last entry is a system turn, appends the question as a new user entry.
         Otherwise, it is appended to the last user entry, ensuring that the conversation alternates between the user and the assistant.
         """
-
         if not fewshot_as_multiturn:
             # if no messages or last message is system, append as new user entry
             if len(labeled_examples) == 0 or labeled_examples[-1]["role"] == "system":
                 labeled_examples.append({"role": "user", "content": question})
             # if last message is user, append to it to avoid two user messages in a row
             else:
-                labeled_examples[-1]["content"].extend([question])
+                labeled_examples[-1]["content"] += question
         else:
             # if fewshot_as_multiturn is True, append as next user entry (last is always assistant)
             labeled_examples.append({"role": "user", "content": question})
@@ -1062,6 +1039,7 @@ class ConfigurableTask(Task):
         system_instruction: Optional[str] = None,
         apply_chat_template: bool = False,
         fewshot_as_multiturn: bool = False,
+        chat_template: Optional[Callable] = None,
     ) -> str:
         """Returns a fewshot context string that is made up of a prepended description
         (if provided), the `num_fewshot` number of examples, and an appended prompt example.
