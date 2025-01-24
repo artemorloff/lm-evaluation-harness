@@ -4,7 +4,7 @@ import logging
 import random
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -74,7 +74,11 @@ def simple_evaluate(
     numpy_random_seed: int = 1234,
     torch_random_seed: int = 1234,
     fewshot_random_seed: int = 1234,
+<<<<<<< HEAD
     truncation_mode: str = "default_left",
+=======
+    truncation_args: Optional[Dict[str, Union[str, bool, int]]] = None,
+>>>>>>> feature/enhanced_truncation
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -133,7 +137,11 @@ def simple_evaluate(
         Random seed for torch. If set to None, the seed will not be set.
     :param fewshot_random_seed: int
         Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
+<<<<<<< HEAD
     :param truncation_mode: str
+=======
+    :param truncation_args: Dict[str, Union[str, bool, int]]
+>>>>>>> feature/enhanced_truncation
         The mode of truncation applied to sequences.
 
     :return
@@ -314,7 +322,11 @@ def simple_evaluate(
         apply_chat_template=apply_chat_template,
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
+<<<<<<< HEAD
         truncation_mode=truncation_mode,
+=======
+        truncation_args=truncation_args,
+>>>>>>> feature/enhanced_truncation
     )
 
     if lm.rank == 0:
@@ -349,7 +361,11 @@ def simple_evaluate(
                 "numpy_seed": numpy_random_seed,
                 "torch_seed": torch_random_seed,
                 "fewshot_seed": fewshot_random_seed,
+<<<<<<< HEAD
                 "truncation_mode": truncation_mode,
+=======
+                "truncation_args": truncation_args,
+>>>>>>> feature/enhanced_truncation
             }
         )
         results["git_hash"] = get_git_commit_hash()
@@ -375,7 +391,11 @@ def evaluate(
     apply_chat_template: Union[bool, str] = False,
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
+<<<<<<< HEAD
     truncation_mode: str = "default_left",
+=======
+    truncation_args: Optional[Dict[str, Union[str, bool, int]]] = None,
+>>>>>>> feature/enhanced_truncation
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -400,7 +420,11 @@ def evaluate(
         Defaults to False (no chat template applied).
     :param fewshot_as_multiturn: bool
         Whether to provide the fewshot examples as a multiturn conversation or a single user turn.
+<<<<<<< HEAD
     :param truncation_mode: str
+=======
+    :param truncation_args: Dict[str, Union[str, bool, int]]
+>>>>>>> feature/enhanced_truncation
         The mode of truncation applied to sequences.
 
     :return
@@ -465,7 +489,11 @@ def evaluate(
             tokenizer_name=getattr(lm, "tokenizer_name", "")
             if apply_chat_template
             else "",
+<<<<<<< HEAD
             truncation_mode=truncation_mode,
+=======
+            truncation_args=truncation_args,
+>>>>>>> feature/enhanced_truncation
             lm=lm,
         )
         eval_logger.debug(

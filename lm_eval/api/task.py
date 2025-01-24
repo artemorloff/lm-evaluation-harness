@@ -41,6 +41,7 @@ from lm_eval.api.registry import (
 from lm_eval.caching.cache import load_from_cache, save_to_cache
 from lm_eval.filters import build_filter_ensemble
 from lm_eval.prompts import get_prompt
+from lm_eval.truncation_utils import truncate_and_chat_template
 
 
 ALL_OUTPUT_TYPES = [
@@ -389,7 +390,11 @@ class Task(abc.ABC):
         fewshot_as_multiturn: bool = False,
         chat_template: Optional[Callable] = None,
         tokenizer_name: str = "",
+<<<<<<< HEAD
         truncation_mode: str = "default_left",
+=======
+        truncation_args: Optional[Dict[str, Union[str, bool, int]]] = None,
+>>>>>>> feature/enhanced_truncation
         lm: "LM" = None,
     ) -> None:
         """Build a set of Instances for a task, and store them in task.instances"""
@@ -444,13 +449,26 @@ class Task(abc.ABC):
             total=num_docs,
         ):
             # sample fewshot context #TODO: need to offset doc_id by rank now!
+<<<<<<< HEAD
             # fewshot_ctx is a List
+=======
+            # fewshot_ctx is a List like [system_prompt, fewshot1, fewshot2, ...]
+            # TODO: system_promt is defined once and added to all task samples
+>>>>>>> feature/enhanced_truncation
             fewshot_ctx, first_system = self.fewshot_context(
                 doc,
                 0 if self.config.num_fewshot is None else self.config.num_fewshot,
                 system_instruction,
                 apply_chat_template,
                 fewshot_as_multiturn,
+<<<<<<< HEAD
+=======
+            )
+
+            # just add the test sample at the end of the list
+            fewshot_ctx = self.add_test_sample(
+                doc, fewshot_ctx, apply_chat_template, fewshot_as_multiturn
+>>>>>>> feature/enhanced_truncation
             )
 
             # just add the test sample at the end of the list
@@ -474,6 +492,12 @@ class Task(abc.ABC):
             
             for elem in inst:
                 elem = self.truncate_and_chat_template(elem, lm, chat_template, truncation_mode, first_system)
+
+            # TODO: add some notification system here based on returned status
+            for elem in inst:
+                elem, status = truncate_and_chat_template(
+                    elem, lm, chat_template, truncation_args, first_system
+                )
 
             instances.append(inst)
 
@@ -1069,7 +1093,13 @@ class ConfigurableTask(Task):
         labeled_examples = []
         first_system = False
 
+<<<<<<< HEAD
         system_prompt = self.define_system_prompt(doc, system_instruction, apply_chat_template)
+=======
+        system_prompt = self.define_system_prompt(
+            doc, system_instruction, apply_chat_template
+        )
+>>>>>>> feature/enhanced_truncation
 
         if system_prompt is not None:
             labeled_examples.extend(system_prompt)
@@ -1085,10 +1115,16 @@ class ConfigurableTask(Task):
             else:
                 fewshots = self.sampler.get_context(doc, num_fewshot)
             labeled_examples.extend(fewshots)
+<<<<<<< HEAD
         
         return labeled_examples, first_system
 
     
+=======
+
+        return labeled_examples, first_system
+
+>>>>>>> feature/enhanced_truncation
     @utils.positional_deprecated
     def add_test_sample(
         self,
@@ -1140,7 +1176,10 @@ class ConfigurableTask(Task):
                     return labeled_examples + [choices[example]]
                 else:
                     return labeled_examples + [str(example)]
+<<<<<<< HEAD
                 
+=======
+>>>>>>> feature/enhanced_truncation
 
     @utils.positional_deprecated
     def define_system_prompt(
@@ -1167,6 +1206,7 @@ class ConfigurableTask(Task):
 
         # add system prompt if specified
         if system_prompt:
+<<<<<<< HEAD
 
             # add system prompt if specified
             if apply_chat_template:
@@ -1353,6 +1393,15 @@ class ConfigurableTask(Task):
         joined = "".join(request)
         return joined
 
+=======
+            # add system prompt if specified
+            if apply_chat_template:
+                return {"role": "system", "content": system_prompt}
+
+            return system_prompt
+        # TODO: returning None is bad practice
+        return None
+>>>>>>> feature/enhanced_truncation
 
     def apply_filters(self):
         """Iterates over FilterEnsembles and applies them to instances"""
