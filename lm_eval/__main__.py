@@ -259,19 +259,6 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Sets trust_remote_code to True to execute code to create HF Datasets from the Hub",
     )
     parser.add_argument(
-<<<<<<< HEAD
-        "--truncation_mode",
-        type=str,
-        default="default_left",
-        help=(
-            "The truncation mode. Available options:"
-            "\n`default_left` - classical truncation of all tokens from the left"
-            "\n`default_right` - the same classical truncation of all tokens from the right side"
-            "\n`fewshots_only` - truncate the whole fewshots until sequence fits into context or fails"
-            "\n`user_left` - truncate exclusively user prompt text from the left"
-            "\n`user_right` - truncate exclusively user prompt text from the right"
-        )
-=======
         "--truncation_args",
         type=str,
         default="how=default,on=tokens,side=left,keep_first=False,max_symbols=2048,max_new_symbols=256",
@@ -292,7 +279,6 @@ def setup_parser() -> argparse.ArgumentParser:
             "\n`max_symbols`:\n\tinteger, the maximum number of symbols in request, default is 2048"
             "\n`max_new_symbols`:\n\tinteger, the maximum number of new symbols to subtract this value from `max_symbols`, default is 256"
         ),
->>>>>>> feature/enhanced_truncation
     )
     return parser
 
@@ -351,15 +337,8 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
             "REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT."
         )
 
-<<<<<<< HEAD
-    if args.truncation_mode not in ["default_left", "default_right", "fewshots_only", "user_left", "user_right"]:
-        raise ValueError(
-            "The `--truncation_mode` arguement should be one of ['default_left', 'default_right', 'fewshots_only', 'user_left', 'user_right']"
-        )
-=======
     # make it a valid dict with truncation params
     truncation_args = process_truncation_args(args.truncation_args)
->>>>>>> feature/enhanced_truncation
 
     if args.tasks is None:
         eval_logger.error("Need to specify task to evaluate.")
@@ -451,11 +430,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         numpy_random_seed=args.seed[1],
         torch_random_seed=args.seed[2],
         fewshot_random_seed=args.seed[3],
-<<<<<<< HEAD
-        truncation_mode=args.truncation_mode,
-=======
         truncation_args=truncation_args,
->>>>>>> feature/enhanced_truncation
         **request_caching_args,
     )
 
