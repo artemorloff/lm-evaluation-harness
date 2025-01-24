@@ -1,9 +1,41 @@
-from typing import Dict, Union
+import logging
+from collections import defaultdict
+from statistics import mean, median
+from typing import Dict, List, Tuple, Union
 
 from lm_eval.utils import simple_parse_args_string
 
 
-def process_truncation_args(args: Dict[str, str]) -> Dict[str, Union[str, int, bool]]:
+logger = logging.getLogger("lm-eval")
+
+##############################################################################
+# Глобальный реестр для статистики обрезки. 
+##############################################################################
+_TRUNC_STATS = defaultdict(lambda: {
+    "total_samples": 0,      # общее число обработанных сэмплов
+    "truncated_samples": 0,  # сколько реально пришлось обрезать
+    "orig_lengths": [],      # длины (токенов/символов) до обрезки
+    "trunc_lengths": [],     # длины после обрезки
+    "cut_amounts": []        # на сколько укоротили (orig_len - trunc_len)
+})
+
+
+def process_truncation_args(args: Union[str, Dict[str, Union[str, bool, int]]]) -> Dict[str, Union[str, bool, int]]:
+    """
+    Преобразует строку (формата: "how=default,on=tokens,side=left,...") или словарь
+    c настройками обрезки в единый словарь с дефолтными значениями.
+
+    Параметры в выходном словаре:
+    -----------------------------
+    how: str             - Режим обрезки ('no', 'default', 'fewshots', 'user', 'transformers')
+    on: str              - 'tokens' или 'symbols'
+    side: str            - 'left' или 'right'
+    keep_first: bool     - Нужно ли сохранять первый фьюшот целиком (актуально для how='fewshots')
+    max_symbols: int     - Лимит по символам (on='symbols')
+    max_new_symbols: int - Резерв по символам под generate
+    max_length: int      - Лимит по токенам (on='tokens')
+    max_new_tokens: int  - Резерв по токенам под generate
+    """
     default_args = {
         "how": "no",
         "on": "tokens",
@@ -11,521 +43,352 @@ def process_truncation_args(args: Dict[str, str]) -> Dict[str, Union[str, int, b
         "keep_first": False,
         "max_symbols": 2048,
         "max_new_symbols": 256,
+        "max_length": 2048,
+        "max_new_tokens": 256,
     }
-    if args:
-        args = simple_parse_args_string(args)
+    if isinstance(args, str):
+        parsed = simple_parse_args_string(args)
+        default_args.update(parsed)
+    elif isinstance(args, dict):
         default_args.update(args)
     return default_args
 
 
-def unpack_group(lst):
-    return [elem for pack in lst for elem in pack]
+def tokenize_sequence(
+    seq: Union[str, List, Dict],
+    model,
+    add_special_tokens: bool = False,
+    do_symbol: bool = False
+) -> List[int]:
+    """
+    Превращает входную последовательность seq в список "токенов".
+      - Если do_symbol=True, 1 символ = 1 "токен" .
+      - Иначе пытаемся вызвать модельную токенизацию:
+         1) model.tokenizer(...)
+         2) model.tokenize(...)
+         3) fallback: seq.split()
+
+    seq:  может быть строкой или списком (например, чат-история).
+    model: объект модели, у которой может быть tokenizer, либо метод tokenize().
+    """
+    # Если включен режим "symbols", разбиваем по символам
+    if do_symbol:
+        if isinstance(seq, str):
+            return list(range(len(seq)))  # просто range от 0..длина
+        elif isinstance(seq, list):
+            merged = _convert_list_to_string(seq)
+            return list(range(len(merged)))
+        else:
+            return []
+
+    # Если do_symbol=False, пробуем реальную токенизацию
+    text = seq if isinstance(seq, str) else _convert_list_to_string(seq)
+
+    tokenizer = getattr(model, "tokenizer", None)
+    if callable(tokenizer):
+        enc = tokenizer(text, add_special_tokens=add_special_tokens)
+        if "input_ids" in enc:
+            return enc["input_ids"]
+
+    if hasattr(model, "tokenize") and callable(model.tokenize):
+        return model.tokenize(text)
+
+    # Если ничего не получилось 
+    return text.split()
 
 
-def group_dicts(req, skip_system):
-    groups = []
-    if skip_system:
-        groups.extend([[req[0]]])  # system instaruction goes as separate list
-    # split remaining seq into pairs user-item
-    for first in range(skip_system, len(req) - 1, 2):
-        groups.extend([[req[first], req[first + 1]]])
-    groups.extend([[req[-1]]])
-    return groups
-
-
-def tokenize_sequence(seq, tokenizer, add_special_tokens, symbols):
-    # TODO: make sure it works for API and vLLM tokenizers
-    if symbols:
-        # consider 1 symbol = 1 token, for models with no tokenizer the only option
-        return seq
-    return tokenizer(seq, add_special_tokens=add_special_tokens)["input_ids"]
-
-
-def apply_chat_template(seq, tokenizer, chat_template, add_generation_prompt, tokenize):
-    # TODO: definitely work only for HF models
-    if tokenizer is None:
-        return chat_template(seq)
-    return tokenizer.apply_chat_template(
-        seq, add_generation_prompt=add_generation_prompt, tokenize=tokenize
-    )
-
-
-def instance_type(func):
-    def wrapper(request, **kwargs):
-        if len(request) == 1:
-            return func(
-                main=request[0], instance_type="loglikelihood_rolling", **kwargs
-            )
-        elif request[0] == "":
-            return func(main=request[1], instance_type="acc_mutual_info", **kwargs)
-        elif isinstance(request[1], dict):
-            return func(main=request[0], instance_type="generate_until", **kwargs)
-        elif isinstance(request[0], list) and isinstance(request[1], (str, int, float)):
-            return func(
-                main=request[0],
-                additional=request[1],
-                instance_type="loglikelihood",
-                **kwargs,
-            )
-
-    return wrapper
-
-
-def context_type(func):
-    def wrapper(main, additional="", instance_type="generate_until", **kwargs):
-        if isinstance(main, str):
-            return func(main, additional, instance_type, "string", **kwargs)
-        elif isinstance(main, list):
-            if isinstance(main[0], str):
-                return func(main, additional, instance_type, "no_template", **kwargs)
-            if isinstance(main[0], dict):
-                if isinstance(main[-1]["content"], list):
-                    return func(
-                        main, additional, instance_type, "chat_template", **kwargs
-                    )
-                else:
-                    return func(main, additional, instance_type, "multiturn", **kwargs)
-
-    return wrapper
-
-
-def fewshots_truncation(
-    request,
-    target,
-    instance_type,
-    context_type,
-    first_system,
-    tokenizer,
-    truncation_args,
-    chat_template,
-    add_special_tokens,
-    max_new_tokens,
-    max_length,
-):
-    if context_type == "string":
-        return request, "nothing"
-    if not len(request):
-        return request, "empty"
-    # do not cut off system prompt, so skip it if any
-    skip_system = int(first_system)
-    # whether to preserve the first element for truncation
-    skip_first = int(truncation_args["keep_first"])
-    # small hack, with no tokenizer this case may be reduced to no chat template one
-
-    if len(request) and isinstance(request[0], list):
-        req = []
-        for lst in request:
-            if len(lst) == 1:
-                req.extend([lst[0]["content"]])
-            else:
-                req.extend([lst[0]["content"] + lst[1]["content"]])
+def apply_chat_template(
+    seq: Union[List, str],
+    model,
+    add_generation_prompt: bool = False,
+    do_tokenize: bool = False
+) -> Union[str, List[int]]:
+    """
+    Применяет (при наличии) chat-шаблон модели к seq.
+    Если do_tokenize=True, возвращает список токенов, иначе готовую строку.
+    """
+    if hasattr(model, "chat_template") and callable(model.chat_template):
+        return model.chat_template(seq, add_generation_prompt=add_generation_prompt, tokenize=do_tokenize)
     else:
-        # do not change the initial sequence
-        req = request[:]
-
-    if context_type == "no_template":
-        # append target for loglikelihood/multiple-choice, otherwise add empty string
-        req[-1] += target
-        # minimal length of request to truncate anything, +1 is for doc itself
-        min_number_elements = skip_system + skip_first + 1
-        # if skip_first and zero-shot = error
-        if len(req) < min_number_elements:
-            return request, "bad params"
-        # TODO: do not tokenize the entire seq, tokenize shot by shot
-        tokens = tokenize_sequence(
-            req, tokenizer, add_special_tokens, truncation_args["on"] == "symbols"
-        )
-        # remaining for user prompt tokens, for generation tasks subtract tokens to be generated
-        # TODO: take into account model type (seq2seq do not need subtraction)
-        remain_tokens = max_length - max_new_tokens * int(
-            instance_type == "generate_until"
-        )
-        # accumulate the total sum
-        sum_seq = 0
-        if truncation_args["side"] == "right":
-            # skip system prompt
-            start = skip_system
-            # keep doc (question from test set) and may keep last shot
-            end = len(tokens) - skip_first - 1
-            reverse = 1
-        else:
-            # consider left to be default option
-            # may skip first shot and skip system prompt
-            start = skip_system + skip_first
-            # keep doc (question from test set)
-            end = len(tokens) - 1
-            reverse = -1
-        # minimal amount of tokens decided by the user
-        sum_seq += sum(map(len, tokens[:start])) + sum(map(len, tokens[end:]))
-        if sum_seq > max_length:
-            return request, "error"
-        result = 0
-        for seq in tokens[start:end][::reverse]:
-            sum_seq += len(seq)
-            if sum_seq > remain_tokens:
-                break
-            result += 1
-        # final = system_prompt + shots + keep_first + doc (right)
-        if truncation_args["side"] == "right":
-            final = (
-                request[:skip_system]
-                + request[skip_system : skip_system + result]
-                + request[-2 : -2 + skip_first]
-                + request[-1:]
-            )
-        # final = system_prompt + keep_first + shots + doc (left)
-        else:
-            final = (
-                request[:skip_system]
-                + request[skip_system : skip_system + skip_first]
-                + request[-1 - result : -1]
-                + request[-1:]
-            )
-
-        return final, result + skip_first
-    elif context_type == "chat_template":
-        if truncation_args["on"] != "symbols":
-            if first_system:
-                system = [req[0]]
-                system_tokens = apply_chat_template(
-                    system, tokenizer, chat_template, False, True
-                )
-                total_tokens = apply_chat_template(
-                    [req[0], {"role": "user", "content": "".join(req[-1]["content"])}],
-                    tokenizer,
-                    chat_template,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                )
-            else:
-                system_tokens = []
-                total_tokens = apply_chat_template(
-                    [{"role": "user", "content": "".join(req[-1]["content"])}],
-                    tokenizer,
-                    chat_template,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                )
-            user_tokens = tokenize_sequence(
-                ["".join(req[-1]["content"])], tokenizer, add_special_tokens, False
-            )[0]
-            # offset = system prompt tokens + all special and generation prompt tokens that will always be in input
-            offset = len(system_tokens) + (
-                len(total_tokens) - len(system_tokens) - len(user_tokens)
-            )
-            # with no chat template there could be only two (system, user) or one (user) role in request
-            # user prompt is just a list of fewshots, this case is reduced to the no_template one
-            user, status = fewshots_truncation(
-                req[-1]["content"],
-                target,
-                instance_type,
-                "no_template",
-                False,
-                tokenizer,
-                truncation_args,
-                chat_template,
-                add_special_tokens,
-                max_new_tokens,
-                max_length - offset,
-            )
-        else:
-            if first_system:
-                system = [req[0]["content"]]
-                len_system = len(system)
-            else:
-                len_system = 0
-            user, status = fewshots_truncation(
-                req[-1]["content"],
-                target,
-                instance_type,
-                "no_template",
-                False,
-                tokenizer,
-                truncation_args,
-                chat_template,
-                add_special_tokens,
-                max_new_tokens,
-                max_length - len_system,
-            )
-        if first_system:
-            final = [request[0], {"role": "user", "content": user}]
-        else:
-            final = [{"role": "user", "content": user}]
-        return final, status
-    elif context_type == "multiturn":
-        # for symbols truncation take into account only `content` of each dict
-        if truncation_args["on"] == "symbols":
-            groups = group_dicts(req, skip_system)
-            final, status = fewshots_truncation(
-                groups,
-                target,
-                instance_type,
-                "no_template",
-                first_system,
-                tokenizer,
-                truncation_args,
-                chat_template,
-                add_special_tokens,
-                max_new_tokens,
-                max_length,
-            )
-            result = []
-            for element in final:
-                for dictionary in element:
-                    result.extend([dictionary])
-            return result, status
-        else:
-            offset_max_len = max_length - max_new_tokens * int(
-                instance_type == "generate_until"
-            )
-            # get number of fewshots (subtract system prompt and doc)
-            num_fewshots = (len(req) - skip_system - 1) // 2
-            if num_fewshots == 0 and skip_first:
-                return request, "bad params"
-            # get the number of tokens for the entire request
-            tokenized_target = tokenize_sequence(
-                target, add_special_tokens=False, tokenizer=tokenizer, symbols=False
-            )
-            tokens = (
-                apply_chat_template(
-                    req,
-                    tokenizer,
-                    chat_template,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                )
-                + tokenized_target
-            )
-            # fits with no truncation
-            if len(tokens) <= offset_max_len:
-                return request, num_fewshots
-            # zero-shot, but still to long to fit into max_length
-            elif len(tokens) > offset_max_len and num_fewshots == 0:
-                return request, "error"
-            elif len(tokens) > offset_max_len and num_fewshots == 1 and skip_first:
-                return request, "bad params"
-            else:
-                # define the length of the system prompt (same for docs from the same task)
-                if first_system:
-                    system_tokens = apply_chat_template(
-                        [req[0]],
-                        tokenizer,
-                        chat_template,
-                        add_generation_prompt=False,
-                        tokenize=True,
-                    )
-                    len_system = len(system_tokens)
-                else:
-                    len_system = 0
-
-                system_and_doc = req[:skip_system] + [req[-1]]
-                sys_doc_tokens = apply_chat_template(
-                    system_and_doc,
-                    tokenizer,
-                    chat_template,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                )
-                # even if has default system prompt, len_doc takes it into account
-                len_doc = len(sys_doc_tokens) - len_system
-                mean_tokens = (len(tokens) - len_system - len_doc) // num_fewshots
-
-                approx_fewshots_num = (
-                    offset_max_len - len_system - len_doc - len(tokenized_target)
-                ) // mean_tokens - skip_first
-
-                groups = group_dicts(req, skip_system)
-
-                const_parts = [[], []]
-                if skip_system:
-                    const_parts[0].extend(groups[0])
-                if skip_first and truncation_args["side"] == "right":
-                    const_parts[1].extend(groups[-2])
-                    start = skip_system
-                    end = -2
-                elif skip_first:
-                    const_parts[0].extend(groups[skip_system])
-                    start = skip_system + 1
-                    end = -1
-                else:
-                    start = skip_system
-                    end = -1
-                const_parts[1].extend(groups[-1])
-
-                actual_shots = approx_fewshots_num
-
-                if truncation_args["side"] == "right":
-                    temp_result = (
-                        const_parts[0]
-                        + unpack_group(groups[start : start + actual_shots])
-                        + const_parts[1]
-                    )
-                else:
-                    temp_result = (
-                        const_parts[0]
-                        + unpack_group(groups[start:end][::-1][:actual_shots][::-1])
-                        + const_parts[1]
-                    )
-
-                sum_seq = len(
-                    apply_chat_template(
-                        temp_result,
-                        tokenizer,
-                        chat_template,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                    )
-                ) + len(tokenized_target)
-
-                if sum_seq > offset_max_len:
-                    for i in range(1, num_fewshots - skip_first - actual_shots):
-                        if truncation_args["side"] == "right":
-                            temp_result = (
-                                const_parts[0]
-                                + unpack_group(
-                                    groups[start : start + (actual_shots - i)]
-                                )
-                                + const_parts[1]
-                            )
-                        else:
-                            temp_result = (
-                                const_parts[0]
-                                + unpack_group(
-                                    groups[start:end][::-1][: (actual_shots - i)][::-1]
-                                )
-                                + const_parts[1]
-                            )
-                        sum_seq = len(
-                            apply_chat_template(
-                                temp_result,
-                                tokenizer,
-                                chat_template,
-                                tokenize=True,
-                                add_generation_prompt=True,
-                            )
-                        ) + len(tokenized_target)
-                        if sum_seq <= offset_max_len:
-                            return temp_result, actual_shots - i + skip_first
-                    if sum_seq > offset_max_len:
-                        return request, "bad params"
-                elif sum_seq < offset_max_len:
-                    prev = temp_result[:]
-                    for i in range(actual_shots + 1, num_fewshots - skip_first + 1):
-                        if truncation_args["side"] == "right":
-                            temp_result = (
-                                const_parts[0]
-                                + unpack_group(groups[start : start + i])
-                                + const_parts[1]
-                            )
-                        else:
-                            temp_result = (
-                                const_parts[0]
-                                + unpack_group(groups[start:end][::-1][:i][::-1])
-                                + const_parts[1]
-                            )
-                        sum_seq = len(
-                            apply_chat_template(
-                                temp_result,
-                                tokenizer,
-                                chat_template,
-                                tokenize=True,
-                                add_generation_prompt=True,
-                            )
-                        ) + len(tokenized_target)
-                        if sum_seq >= offset_max_len or i == num_fewshots - skip_first:
-                            return prev, i
-                        prev = temp_result
-                else:
-                    return temp_result, actual_shots + skip_first
-
-
-@instance_type
-@context_type
-def truncate(
-    request,
-    target,
-    instance_type,
-    context_type,
-    first_system,
-    tokenizer,
-    truncation_args,
-    chat_template,
-    add_special_tokens,
-    max_new_tokens,
-    max_length,
-    **kwargs,
-):
-    if truncation_args["how"] == "fewshots":
-        return fewshots_truncation(
-            request,
-            target,
-            instance_type,
-            context_type,
-            first_system,
-            tokenizer,
-            truncation_args,
-            chat_template,
-            add_special_tokens,
-            max_new_tokens,
-            max_length,
-        )
-    elif truncation_args["how"] == "no":
-        return request, "not_used"
-    return request, "not_implemented"
-
-
-def restore_form(request, new_query, chat_template, tokenizer):
-    if isinstance(new_query, list):
-        if len(new_query):
-            if isinstance(new_query[0], str):
-                new_query = "".join(new_query)
-            elif isinstance(new_query[-1]["content"], list):
-                new_query[-1]["content"] = "".join(new_query[-1]["content"])
-        else:
-            new_query = ""
-
-    if not isinstance(new_query, str):
-        new_query = apply_chat_template(
-            new_query,
-            tokenizer,
-            chat_template,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    args = request.arguments
-
-    if len(args) == 1:
-        new_pair = (new_query,)
-    elif args[0] == "":
-        new_pair = ("", new_query)
-    else:
-        new_pair = (new_query, args[1])
-
-    request.arguments = new_pair
-    return request
+        text = seq if isinstance(seq, str) else _convert_list_to_string(seq)
+        if do_tokenize:
+            return tokenize_sequence(text, model, do_symbol=False)
+        return text
 
 
 def truncate_and_chat_template(
-    request, lm, chat_template, truncation_args, first_system
-):
-    if truncation_args["on"] == "symbols":
-        max_len = truncation_args["max_symbols"]
-        max_new = truncation_args["max_new_symbols"]
+    request,
+    lm,
+    chat_template,
+    truncation_args: Dict[str, Union[str, bool, int]],
+    first_system: bool,
+    task_name: str = "unknown_task"
+) -> Tuple:
+    """
+    Главная функция обрезки + (опциональной) chat-шаблонизации каждого запроса (Instance).
+    Возвращает (обновлённый_request, status), где status — строка с кодом (например, 'truncated_default').
+
+    - request:   экземпляр Instance (из evaluator), у которого есть .arguments
+    - lm:        модель (например, HF-модель, vLLM-модель и т.д.)
+    - chat_template: функц. шаблона (можно передать None, если не нужно)
+    - truncation_args: словарь, полученный из process_truncation_args
+    - first_system:   флаг о том, что первая реплика — system (для чатов, если нужно)
+    - task_name:      имя задачи для логгирования статистики
+    """
+    how = truncation_args.get("how", "no")
+    on = truncation_args.get("on", "tokens")
+    side = truncation_args.get("side", "left")
+    keep_first = truncation_args.get("keep_first", False)
+    max_symbols = truncation_args.get("max_symbols", 2048)
+    max_new_symbols = truncation_args.get("max_new_symbols", 256)
+    max_length = truncation_args.get("max_length", 2048)
+    max_new_tokens = truncation_args.get("max_new_tokens", 256)
+
+    # Распаковываем аргументы
+    req_type = request.request_type
+    args = request.arguments
+    if len(args) == 1:
+        ctx, cont = args[0], ""
     else:
-        max_len = getattr(lm, "max_length", 2048)
-        max_new = getattr(lm, "max_gen_toks", 256)
-    special_tokens = getattr(lm, "add_bos_token", False)
-    tokenizer = getattr(lm, "tokenizer", None)
-    req = request.arguments
-    new_query, status = truncate(
-        req,
-        first_system=first_system,
-        tokenizer=tokenizer,
-        truncation_args=truncation_args,
-        chat_template=chat_template,
-        add_special_tokens=special_tokens,
-        max_new_tokens=max_new,
+        ctx, cont = args[0], args[1]
+
+    # Определяем, нужно ли резервировать под генерацию
+    is_gen = (req_type == "generate_until")
+    # Определяем реальный max_context_len
+    if on == "tokens":
+        max_context_len = max_length - (max_new_tokens if is_gen else 0)
+    else:  # 'symbols'
+        max_context_len = max_symbols - (max_new_symbols if is_gen else 0)
+
+    # Меряем длину оригинала
+    do_symbol = (on == "symbols")
+    original_tokens = tokenize_sequence(ctx, lm, add_special_tokens=False, do_symbol=do_symbol)
+    original_len = len(original_tokens)
+
+    # Если не остаётся места под prompt
+    if max_context_len < 1:
+        # Обнулим контекст
+        request.arguments = ("", cont) if len(args) > 1 else ("",)
+        register_truncation_stats(task_name, original_len, 0)  # зафиксируем
+        return request, f"error_{how}_no_space"
+
+    # Если how=='no' — не обрезаем
+    if how == "no":
+        register_truncation_stats(task_name, original_len, original_len)
+        return request, "no_truncation"
+
+    # Если how=='transformers' — встроенная обрезка
+    if how == "transformers":
+        truncated_ctx = _transformers_truncate(ctx, lm, max_context_len, on)
+        new_tokens = tokenize_sequence(truncated_ctx, lm, do_symbol=do_symbol)
+        register_truncation_stats(task_name, original_len, len(new_tokens))
+        request.arguments = (truncated_ctx, cont) if len(args) > 1 else (truncated_ctx,)
+        return request, "truncated_transformers"
+
+    # Иначе — ручные стратегии
+    if original_len <= max_context_len:
+        # Помещается без обрезки
+        register_truncation_stats(task_name, original_len, original_len)
+        return request, f"no_truncation_{how}"
+
+    if how == "default":
+        new_ctx_tokens = _truncate_list_side(original_tokens, max_context_len, side=side)
+        new_ctx = _untokenize_sequence(new_ctx_tokens, ctx, lm, do_symbol)
+        register_truncation_stats(task_name, original_len, len(new_ctx_tokens))
+        request.arguments = (new_ctx, cont) if len(args) > 1 else (new_ctx,)
+        return request, "truncated_default"
+
+    elif how == "user":
+        # Режем справа, оставляя (max_context_len) "токенов"/символов
+        cut_count = original_len - max_context_len
+        new_ctx_tokens = original_tokens[:-cut_count]
+        new_ctx = _untokenize_sequence(new_ctx_tokens, ctx, lm, do_symbol)
+        register_truncation_stats(task_name, original_len, len(new_ctx_tokens))
+        request.arguments = (new_ctx, cont) if len(args) > 1 else (new_ctx,)
+        return request, "truncated_user"
+
+    elif how == "fewshots":
+        new_ctx = _drop_fewshots(ctx, lm, max_context_len, on, side, keep_first)
+        new_len = len(tokenize_sequence(new_ctx, lm, do_symbol=do_symbol))
+        register_truncation_stats(task_name, original_len, new_len)
+        request.arguments = (new_ctx, cont) if len(args) > 1 else (new_ctx,)
+        return request, "truncated_fewshots"
+
+    # Если режим не поддерживается
+    register_truncation_stats(task_name, original_len, original_len)
+    return request, f"not_implemented_{how}"
+
+
+##############################################################################
+# Вспомогательные функции для разных стратегий
+##############################################################################
+
+def _transformers_truncate(text, model, max_len: int, on: str) -> str:
+    """Адаптивная обрезка через встроенную truncation у HF-токенизатора.
+       Если on='symbols', режем напрямую по символам.
+    """
+    if on == "symbols":
+        return text[:max_len]
+    tokenizer = getattr(model, "tokenizer", None)
+    if not tokenizer:
+        # fallback
+        return text[:max_len]
+
+    encoded = tokenizer(
+        text,
         max_length=max_len,
+        truncation=True,
+        return_tensors="pt",
+        add_special_tokens=False
     )
-    processed_request = restore_form(request, new_query, chat_template, tokenizer)
-    return processed_request, status
+    return tokenizer.decode(encoded["input_ids"][0], skip_special_tokens=True)
+
+
+def _truncate_list_side(tokens: List, max_len: int, side: str = "left") -> List:
+    """
+    Обрезаем список (токенов/символов) до размера max_len:
+       - side='left' => берём последние max_len
+       - side='right' => первые max_len
+    """
+    if len(tokens) <= max_len:
+        return tokens
+    if side == "left":
+        return tokens[-max_len:]
+    return tokens[:max_len]
+
+
+def _untokenize_sequence(
+    tokens: List,
+    original_ctx: Union[str, List],
+    model,
+    do_symbol: bool
+) -> str:
+    """
+    Превращает список tokens обратно в строку (если do_symbol=False) через model.tokenizer.decode
+    или просто обрезку (если do_symbol=True).
+    """
+    if do_symbol:
+        # tokens — это диапазоны [0..n). Нужно вернуть кусок original_ctx
+        if isinstance(original_ctx, str):
+            return original_ctx[: len(tokens)]
+        # fallback: склеим
+        full_text = _convert_list_to_string(original_ctx)
+        return full_text[: len(tokens)]
+    else:
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer:
+            return tokenizer.decode(tokens, skip_special_tokens=True)
+        else:
+            # fallback: склеим (если это список строк)
+            if len(tokens) and isinstance(tokens[0], str):
+                return " ".join(tokens)
+            return str(tokens)
+
+
+def _drop_fewshots(
+    ctx: str,
+    model,
+    max_context_len: int,
+    on: str,
+    side: str,
+    keep_first: bool
+) -> str:
+    """
+    Примерная функция для "как бы" удаления целых фьюшотов.
+    Упрощённо ищем в ctx разделитель 'FS_DELIM'. Убираем блоки целиком, пока не влезет.
+    """
+    do_symbol = (on == "symbols")
+    parts = ctx.split("FS_DELIM")
+    def length_of(text):
+        return len(tokenize_sequence(text, model, do_symbol=do_symbol))
+
+    # Если и так влезает, возвращаем как есть
+    if length_of(ctx) <= max_context_len:
+        return ctx
+
+    remain = parts[:]
+    while len(remain) > 1:
+        joined = "FS_DELIM".join(remain)
+        if length_of(joined) <= max_context_len:
+            break
+        if side == "right":
+            if keep_first and len(remain) == 2:
+                # если осталось два блока: 1 фьюшот + doc
+                break
+            remain.pop()
+        else:  # side=='left'
+            if keep_first and len(remain) > 1:
+                # сохраняем первый блок
+                if len(remain) == 2:
+                    break
+                remain.pop(1)
+            else:
+                remain.pop(0)
+    return "FS_DELIM".join(remain)
+
+
+def _convert_list_to_string(seq: Union[List, str]) -> str:
+    """
+    Утилита: склеить список (или строку) в строку. Если элементы - dict c полем 'content', тоже добавляем.
+    """
+    if isinstance(seq, str):
+        return seq
+    chunks = []
+    for item in seq:
+        if isinstance(item, dict) and "content" in item:
+            c = item["content"]
+            if isinstance(c, list):
+                chunks.append(" ".join(str(x) for x in c))
+            else:
+                chunks.append(str(c))
+        else:
+            chunks.append(str(item))
+    return " ".join(chunks)
+
+
+##############################################################################
+# Методы для ведения статистики
+##############################################################################
+
+def register_truncation_stats(
+    task_name: str,
+    orig_len: int,
+    trunc_len: int
+):
+    """
+    Фиксируем в глобальном реестре статистику обрезки:
+    - orig_len: длина (токенов/символов) до обрезки
+    - trunc_len: после
+    """
+    d = _TRUNC_STATS[task_name]
+    d["total_samples"] += 1
+    d["orig_lengths"].append(orig_len)
+    d["trunc_lengths"].append(trunc_len)
+    d["cut_amounts"].append(orig_len - trunc_len)
+    if trunc_len < orig_len:
+        d["truncated_samples"] += 1
+
+def print_truncation_stats():
+    """
+    Вывести итоги по всем задачам, которые регистрировались через register_truncation_stats.
+    """
+    for tname, data in _TRUNC_STATS.items():
+        total = data["total_samples"]
+        truncated = data["truncated_samples"]
+        logger.info(f"[Truncation Stats for task='{tname}']")
+        logger.info(f"  total_samples: {total}")
+        logger.info(f"  truncated_samples: {truncated} ({100.0*truncated/total:.1f}%)")
+        if total > 0:
+            o = data["orig_lengths"]
+            t = data["trunc_lengths"]
+            c = data["cut_amounts"]
+            logger.info("  original_length:   min=%.1f, max=%.1f, mean=%.1f, median=%.1f" % (
+                min(o), max(o), mean(o), median(o)
+            ))
+            logger.info("  truncated_length:  min=%.1f, max=%.1f, mean=%.1f, median=%.1f" % (
+                min(t), max(t), mean(t), median(t)
+            ))
+            logger.info("  cut_amount:        min=%.1f, max=%.1f, mean=%.1f, median=%.1f" % (
+                min(c), max(c), mean(c), median(c)
+            ))
+        logger.info("")
