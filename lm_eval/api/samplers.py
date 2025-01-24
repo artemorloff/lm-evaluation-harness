@@ -75,43 +75,26 @@ class ContextSampler:
 
         labeled_examples = []
         for doc in selected_docs:
-<<<<<<< HEAD
-            one_sample = ""
-            doc_content = self.doc_to_text(doc)
-            doc_target = self.doc_to_target(doc)
-            one_sample += (
-=======
             one_example = ""
             doc_content = self.doc_to_text(doc)
             doc_target = self.doc_to_target(doc)
             one_example += (
->>>>>>> feature/enhanced_truncation
                 doc_content
                 if self.config.doc_to_choice is None or isinstance(doc_content, str)
                 else self.doc_to_choice(doc)[doc_content]
             )
 
             if doc_target != "":
-<<<<<<< HEAD
-                one_sample += self.target_delimiter
-                one_sample += (
-=======
                 one_example += self.target_delimiter
                 one_example += (
->>>>>>> feature/enhanced_truncation
                     str(doc_target[0])
                     if isinstance(doc_target, list)
                     else doc_target
                     if self.config.doc_to_choice is None or isinstance(doc_target, str)
                     else str(self.doc_to_choice(doc)[doc_target])
                 )
-<<<<<<< HEAD
-                one_sample += self.fewshot_delimiter
-            labeled_examples.extend([one_sample])
-=======
                 one_example += self.fewshot_delimiter
             labeled_examples.extend([one_example])
->>>>>>> feature/enhanced_truncation
 
         return labeled_examples
 
@@ -181,9 +164,9 @@ class FirstNSampler(ContextSampler):
         Draw the first `n` samples in order from the specified split.
         Used for tasks with "canonical" ordered fewshot examples, such as MMLU and CMMLU.
         """
-        assert (
-            n <= len(self.docs)
-        ), f"Error: number of fewshot samples requested exceeds the {len(self.docs)} that are available."
+        assert n <= len(self.docs), (
+            f"Error: number of fewshot samples requested exceeds the {len(self.docs)} that are available."
+        )
         return self.docs[:n]
 
 
