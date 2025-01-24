@@ -9,18 +9,22 @@ from lm_eval.utils import simple_parse_args_string
 logger = logging.getLogger("lm-eval")
 
 ##############################################################################
-# Глобальный реестр для статистики обрезки. 
+# Глобальный реестр для статистики обрезки.
 ##############################################################################
-_TRUNC_STATS = defaultdict(lambda: {
-    "total_samples": 0,      # общее число обработанных сэмплов
-    "truncated_samples": 0,  # сколько реально пришлось обрезать
-    "orig_lengths": [],      # длины (токенов/символов) до обрезки
-    "trunc_lengths": [],     # длины после обрезки
-    "cut_amounts": []        # на сколько укоротили (orig_len - trunc_len)
-})
+_TRUNC_STATS = defaultdict(
+    lambda: {
+        "total_samples": 0,  # общее число обработанных сэмплов
+        "truncated_samples": 0,  # сколько реально пришлось обрезать
+        "orig_lengths": [],  # длины (токенов/символов) до обрезки
+        "trunc_lengths": [],  # длины после обрезки
+        "cut_amounts": [],  # на сколько укоротили (orig_len - trunc_len)
+    }
+)
 
 
-def process_truncation_args(args: Union[str, Dict[str, Union[str, bool, int]]]) -> Dict[str, Union[str, bool, int]]:
+def process_truncation_args(
+    args: Union[str, Dict[str, Union[str, bool, int]]],
+) -> Dict[str, Union[str, bool, int]]:
     """
     Преобразует строку (формата: "how=default,on=tokens,side=left,...") или словарь
     c настройками обрезки в единый словарь с дефолтными значениями.
@@ -58,7 +62,7 @@ def tokenize_sequence(
     seq: Union[str, List, Dict],
     model,
     add_special_tokens: bool = False,
-    do_symbol: bool = False
+    do_symbol: bool = False,
 ) -> List[int]:
     """
     Превращает входную последовательность seq в список "токенов".
@@ -93,7 +97,7 @@ def tokenize_sequence(
     if hasattr(model, "tokenize") and callable(model.tokenize):
         return model.tokenize(text)
 
-    # Если ничего не получилось 
+    # Если ничего не получилось
     return text.split()
 
 
@@ -101,14 +105,16 @@ def apply_chat_template(
     seq: Union[List, str],
     model,
     add_generation_prompt: bool = False,
-    do_tokenize: bool = False
+    do_tokenize: bool = False,
 ) -> Union[str, List[int]]:
     """
     Применяет (при наличии) chat-шаблон модели к seq.
     Если do_tokenize=True, возвращает список токенов, иначе готовую строку.
     """
     if hasattr(model, "chat_template") and callable(model.chat_template):
-        return model.chat_template(seq, add_generation_prompt=add_generation_prompt, tokenize=do_tokenize)
+        return model.chat_template(
+            seq, add_generation_prompt=add_generation_prompt, tokenize=do_tokenize
+        )
     else:
         text = seq if isinstance(seq, str) else _convert_list_to_string(seq)
         if do_tokenize:
@@ -122,7 +128,7 @@ def truncate_and_chat_template(
     chat_template,
     truncation_args: Dict[str, Union[str, bool, int]],
     first_system: bool,
-    task_name: str = "unknown_task"
+    task_name: str = "unknown_task",
 ) -> Tuple:
     """
     Главная функция обрезки + (опциональной) chat-шаблонизации каждого запроса (Instance).
@@ -153,7 +159,7 @@ def truncate_and_chat_template(
         ctx, cont = args[0], args[1]
 
     # Определяем, нужно ли резервировать под генерацию
-    is_gen = (req_type == "generate_until")
+    is_gen = req_type == "generate_until"
     # Определяем реальный max_context_len
     if on == "tokens":
         max_context_len = max_length - (max_new_tokens if is_gen else 0)
@@ -161,8 +167,10 @@ def truncate_and_chat_template(
         max_context_len = max_symbols - (max_new_symbols if is_gen else 0)
 
     # Меряем длину оригинала
-    do_symbol = (on == "symbols")
-    original_tokens = tokenize_sequence(ctx, lm, add_special_tokens=False, do_symbol=do_symbol)
+    do_symbol = on == "symbols"
+    original_tokens = tokenize_sequence(
+        ctx, lm, add_special_tokens=False, do_symbol=do_symbol
+    )
     original_len = len(original_tokens)
 
     # Если не остаётся места под prompt
@@ -192,7 +200,9 @@ def truncate_and_chat_template(
         return request, f"no_truncation_{how}"
 
     if how == "default":
-        new_ctx_tokens = _truncate_list_side(original_tokens, max_context_len, side=side)
+        new_ctx_tokens = _truncate_list_side(
+            original_tokens, max_context_len, side=side
+        )
         new_ctx = _untokenize_sequence(new_ctx_tokens, ctx, lm, do_symbol)
         register_truncation_stats(task_name, original_len, len(new_ctx_tokens))
         request.arguments = (new_ctx, cont) if len(args) > 1 else (new_ctx,)
@@ -223,9 +233,10 @@ def truncate_and_chat_template(
 # Вспомогательные функции для разных стратегий
 ##############################################################################
 
+
 def _transformers_truncate(text, model, max_len: int, on: str) -> str:
     """Адаптивная обрезка через встроенную truncation у HF-токенизатора.
-       Если on='symbols', режем напрямую по символам.
+    Если on='symbols', режем напрямую по символам.
     """
     if on == "symbols":
         return text[:max_len]
@@ -239,7 +250,7 @@ def _transformers_truncate(text, model, max_len: int, on: str) -> str:
         max_length=max_len,
         truncation=True,
         return_tensors="pt",
-        add_special_tokens=False
+        add_special_tokens=False,
     )
     return tokenizer.decode(encoded["input_ids"][0], skip_special_tokens=True)
 
@@ -258,10 +269,7 @@ def _truncate_list_side(tokens: List, max_len: int, side: str = "left") -> List:
 
 
 def _untokenize_sequence(
-    tokens: List,
-    original_ctx: Union[str, List],
-    model,
-    do_symbol: bool
+    tokens: List, original_ctx: Union[str, List], model, do_symbol: bool
 ) -> str:
     """
     Превращает список tokens обратно в строку (если do_symbol=False) через model.tokenizer.decode
@@ -286,19 +294,15 @@ def _untokenize_sequence(
 
 
 def _drop_fewshots(
-    ctx: str,
-    model,
-    max_context_len: int,
-    on: str,
-    side: str,
-    keep_first: bool
+    ctx: str, model, max_context_len: int, on: str, side: str, keep_first: bool
 ) -> str:
     """
     Примерная функция для "как бы" удаления целых фьюшотов.
     Упрощённо ищем в ctx разделитель 'FS_DELIM'. Убираем блоки целиком, пока не влезет.
     """
-    do_symbol = (on == "symbols")
+    do_symbol = on == "symbols"
     parts = ctx.split("FS_DELIM")
+
     def length_of(text):
         return len(tokenize_sequence(text, model, do_symbol=do_symbol))
 
@@ -350,11 +354,8 @@ def _convert_list_to_string(seq: Union[List, str]) -> str:
 # Методы для ведения статистики
 ##############################################################################
 
-def register_truncation_stats(
-    task_name: str,
-    orig_len: int,
-    trunc_len: int
-):
+
+def register_truncation_stats(task_name: str, orig_len: int, trunc_len: int):
     """
     Фиксируем в глобальном реестре статистику обрезки:
     - orig_len: длина (токенов/символов) до обрезки
@@ -368,6 +369,7 @@ def register_truncation_stats(
     if trunc_len < orig_len:
         d["truncated_samples"] += 1
 
+
 def print_truncation_stats():
     """
     Вывести итоги по всем задачам, которые регистрировались через register_truncation_stats.
@@ -377,18 +379,23 @@ def print_truncation_stats():
         truncated = data["truncated_samples"]
         logger.info(f"[Truncation Stats for task='{tname}']")
         logger.info(f"  total_samples: {total}")
-        logger.info(f"  truncated_samples: {truncated} ({100.0*truncated/total:.1f}%)")
+        logger.info(
+            f"  truncated_samples: {truncated} ({100.0 * truncated / total:.1f}%)"
+        )
         if total > 0:
             o = data["orig_lengths"]
             t = data["trunc_lengths"]
             c = data["cut_amounts"]
-            logger.info("  original_length:   min=%.1f, max=%.1f, mean=%.1f, median=%.1f" % (
-                min(o), max(o), mean(o), median(o)
-            ))
-            logger.info("  truncated_length:  min=%.1f, max=%.1f, mean=%.1f, median=%.1f" % (
-                min(t), max(t), mean(t), median(t)
-            ))
-            logger.info("  cut_amount:        min=%.1f, max=%.1f, mean=%.1f, median=%.1f" % (
-                min(c), max(c), mean(c), median(c)
-            ))
+            logger.info(
+                "  original_length:   min=%.1f, max=%.1f, mean=%.1f, median=%.1f"
+                % (min(o), max(o), mean(o), median(o))
+            )
+            logger.info(
+                "  truncated_length:  min=%.1f, max=%.1f, mean=%.1f, median=%.1f"
+                % (min(t), max(t), mean(t), median(t))
+            )
+            logger.info(
+                "  cut_amount:        min=%.1f, max=%.1f, mean=%.1f, median=%.1f"
+                % (min(c), max(c), mean(c), median(c))
+            )
         logger.info("")
