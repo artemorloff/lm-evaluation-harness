@@ -18,7 +18,7 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 
-DEFAULT_AUDIO_PLACEHOLDER = "<audio>"
+DEFAULT_AUDIO_PLACEHOLDERS = ["<audio>", "<audio_1>", "<audio_2>"]
 
 
 @register_model("hf-audiolm-qwen")
@@ -140,13 +140,18 @@ class HFAUDIOLMQWEN(HFLM):
         BatchEncoding, Dict[str, torch.Tensor]
     ]:  # note that this return signature differs from HFLM tok_batch_encode.
         # NOTE: here, we replace <audio> tags with our model's corresponding image_token string value.
-        if not self.chat_applied:
-            strings = [
+        def _replace_placeholder(placeholder, strings):
+            return [
                 replace_placeholders(
-                    string, DEFAULT_AUDIO_PLACEHOLDER, "<|audio_bos|><|AUDIO|><|audio_eos|>", self.max_audios
+                    string, placeholder, "<|audio_bos|><|AUDIO|><|audio_eos|>", self.max_audios
                 )
                 for string in strings
             ]
+        
+        if not self.chat_applied:
+            # TODO<baber>: This still keeps the whitespace in the image placeholder, which is not ideal.
+            for placeholder in DEFAULT_AUDIO_PLACEHOLDERS:
+                strings = _replace_placeholder(placeholder, strings)
         
         encoding = self.processor(
             audios=audios,
@@ -262,10 +267,6 @@ class HFAUDIOLMQWEN(HFLM):
             inputs['input_ids'] = inputs['input_ids'].to("cuda")
             inputs.input_ids = inputs.input_ids.to("cuda")
             cont = self._model_multimodal_generate(inputs, stop=until, **kwargs)
-
-            # generate_ids = self.model.generate(**inputs, max_length=256)
-            # generate_ids = generate_ids[:, inputs.input_ids.size(1):]
-            # response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
             del inputs
             torch.cuda.empty_cache()
