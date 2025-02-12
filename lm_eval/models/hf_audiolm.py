@@ -1,14 +1,11 @@
+import copy
 from typing import Dict, List, Optional, Tuple, Union
 
-import copy
 import torch
-import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
 from transformers import BatchEncoding
-from transformers import PreTrainedTokenizer, GenerationConfig
 
-from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
@@ -17,6 +14,7 @@ from lm_eval.models.utils import (
     replace_placeholders,
     stop_sequences_criteria,
 )
+
 
 DEFAULT_AUDIO_PLACEHOLDERS = ["<audio>", "<audio_1>", "<audio_2>"]
 
@@ -29,7 +27,7 @@ class HFAUDIOLMQWEN(HFLM):
 
     AUTO_MODEL_CLASS = transformers.Qwen2AudioForConditionalGeneration
     MULTIMODAL = True  # flag to indicate, for now, that this model type can run multimodal requests
-    
+
     def __init__(
         self,
         pretrained: Union[str, transformers.PreTrainedModel],
@@ -41,7 +39,6 @@ class HFAUDIOLMQWEN(HFLM):
         super().__init__(pretrained, **kwargs)
         self.max_audios = max_audios
         self.chat_applied: bool = False
-
 
     def _create_tokenizer(
         self,
@@ -92,7 +89,9 @@ class HFAUDIOLMQWEN(HFLM):
         )
         self.tokenizer = self.processor.tokenizer
 
-    def apply_chat_template(self, chat_history: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
+    def apply_chat_template(
+        self, chat_history: List[Dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
         """
         Method to apply a chat template to a list of chat history between user and model.
         """
@@ -132,7 +131,7 @@ class HFAUDIOLMQWEN(HFLM):
     def tok_batch_multimodal_encode(
         self,
         strings: List[str],  # note that input signature of this fn is different
-        audios: List[List], 
+        audios: List[List],
         padding_side: str = "left",
         left_truncate_len: int = None,
         truncation: bool = False,
@@ -143,16 +142,19 @@ class HFAUDIOLMQWEN(HFLM):
         def _replace_placeholder(placeholder, strings):
             return [
                 replace_placeholders(
-                    string, placeholder, "<|audio_bos|><|AUDIO|><|audio_eos|>", self.max_audios
+                    string,
+                    placeholder,
+                    "<|audio_bos|><|AUDIO|><|audio_eos|>",
+                    self.max_audios,
                 )
                 for string in strings
             ]
-        
+
         if not self.chat_applied:
             # TODO<baber>: This still keeps the whitespace in the image placeholder, which is not ideal.
             for placeholder in DEFAULT_AUDIO_PLACEHOLDERS:
                 strings = _replace_placeholder(placeholder, strings)
-        
+
         encoding = self.processor(
             audios=audios,
             text=strings,
@@ -208,10 +210,8 @@ class HFAUDIOLMQWEN(HFLM):
             audios = []
             for audio_lst_dict in aux_arguments:
                 for audio in audio_lst_dict["audio"]:
-                    audios.append(
-                        audio["array"]
-                    )
-            
+                    audios.append(audio["array"])
+
             if not isinstance(contexts, list):
                 contexts = list(
                     contexts
@@ -264,7 +264,7 @@ class HFAUDIOLMQWEN(HFLM):
 
             if "max_length" not in kwargs:
                 kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
-            inputs['input_ids'] = inputs['input_ids'].to("cuda")
+            inputs["input_ids"] = inputs["input_ids"].to("cuda")
             inputs.input_ids = inputs.input_ids.to("cuda")
             cont = self._model_multimodal_generate(inputs, stop=until, **kwargs)
 
