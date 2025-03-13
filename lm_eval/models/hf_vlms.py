@@ -49,12 +49,20 @@ class HFMultimodalLM(HFLM):
     ):
         # We initialize using HFLM's init. Sub-methods like _create_model and _create_tokenizer
         # modify init behavior.
+        if "internvl" in pretrained.lower():
+            self.AUTO_MODEL_CLASS = transformers.AutoModel
+        self.system_instruction = None
         super().__init__(pretrained, **kwargs)
+        if "internvl" in pretrained.lower():
+            IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
+            self.model.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        if "system_instruction" in kwargs:
+            self.system_instruction = kwargs["system_instruction"]
 
         assert self.batch_size != "auto", (
             "Batch size 'auto' is not yet supported for hf-multimodal models."
         )
-        self.chat_applied: bool = False
+        self.chat_applied: bool = False if "internvl" not in pretrained.lower() else True
         # TODO: phi-3.5 "image placeholders" are <image_1>, <image_2>, ... in order. how to handle this case
 
         # HF AutoModelForVision2Seq models have an `image_token_id` value in their configs
@@ -138,7 +146,15 @@ class HFMultimodalLM(HFLM):
             # use_fast=use_fast_tokenizer,
         )
 
-        self.tokenizer = self.processor.tokenizer
+        if "internvl" in self.processor.name_or_path.lower():
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                model_name,
+                revision=revision,
+                trust_remote_code=trust_remote_code
+            )
+
+        else:
+            self.tokenizer = self.processor.tokenizer
 
     def tok_multimodal_encode(
         self, string, images, left_truncate_len=None, add_special_tokens=None
@@ -250,7 +266,7 @@ class HFMultimodalLM(HFLM):
                     raise ValueError(
                         f"Mismatch in image placeholder count. Expected: {expected_image_count}, Actual: {actual_image_count}"
                     )
-
+        # TODO проблема здесь - нельзя использовать в чат хистори словарь из строки и листа
         return self.processor.apply_chat_template(
             chat_history,
             add_generation_prompt=add_generation_prompt,
@@ -289,6 +305,8 @@ class HFMultimodalLM(HFLM):
                 for string in strings
             ]
 
+        current_image_placeholder = DEFAULT_IMAGE_PLACEHOLDER if self.chat_applied else self.image_token
+
         # encode a batch of strings. converts to tensors and pads automatically, unlike tok_encode.
         old_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = padding_side
@@ -303,18 +321,74 @@ class HFMultimodalLM(HFLM):
         if getattr(self.config, "model_type", "") == "llava":
             images = flatten_image_list(images)
 
-        encoding = self.processor(
-            images=images,
-            text=strings,
-            truncation=truncation,
-            padding="longest",
-            return_tensors="pt",
-            # **add_special_tokens, # TODO: at least some Processors error out when passing this. How do we control whether text gets BOS added?
-        )
 
-        encoding.to(  # TODO: our other tokenization methods in HFLM don't typically move to device. this breaks convention
-            self.device, self.model.dtype
-        )  # TODO: This only casts the pixel values. Should they always be float16?
+        # Preprocess images and texts to make it possible to run generate on multi-batch multi-image setup
+        if "internvl" in self.processor.name_or_path.lower():
+            from lm_eval.models.utils import load_image, get_conv_template
+
+            IMG_START_TOKEN = '<img>'
+            IMG_END_TOKEN = '</img>'
+            IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
+
+            # Convert images to tensors
+            pixel_values = []
+            num_patches_list = []
+            for image_batch in images:
+                pixel_value = []
+                num_patches_list_batch = []
+                for image in image_batch:
+                    pixel_value.append(load_image(image, max_num=12))
+                    num_patches_list_batch.append(pixel_value[-1].size(0))
+                pixel_values.append(torch.cat(pixel_value, dim=0))
+                num_patches_list.append(num_patches_list_batch)
+            pixel_values = torch.cat(pixel_values, dim=0)
+
+            # Apply preprocessing from model.batch_chat method
+            queries = []
+            for idx, num_patches_list_batch in enumerate(num_patches_list):
+                question = strings[idx]
+                if pixel_values is not None and current_image_placeholder not in question:
+                    question = f'{current_image_placeholder}\n' + question
+                if self.chat_applied:
+                    template = get_conv_template(self.model.template)
+                    # template.system_message = ""
+                    # template.system_template = ""
+                    template.system_message = self.system_instruction or self.model.system_message
+                    template.append_message(template.roles[0], question)
+                    template.append_message(template.roles[1], None)
+                    query = template.get_prompt()
+                else:
+                    query = question
+                # Handle multi images per batch
+                for num_patches in num_patches_list_batch:
+                    image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.model.num_image_token * num_patches + IMG_END_TOKEN
+                    query = query.replace(current_image_placeholder, image_tokens, 1)
+                queries.append(query)
+
+            self.tokenizer.padding_side = 'left'
+            model_inputs = self.tokenizer(queries, return_tensors='pt', padding=True)
+            encoding = {}
+            encoding["input_ids"] = model_inputs['input_ids'].to(self.device)
+            encoding["attention_mask"] = model_inputs['attention_mask'].to(self.device)
+            encoding["pixel_values"] = pixel_values.to(device=self.device,dtype=self.model.dtype)
+            ### Check next two lines before model.generate
+            # eos_token_id = self.tokenizer.convert_tokens_to_ids(template.sep.strip())
+            # generation_config['eos_token_id'] = eos_token_id
+            
+        else:
+
+            encoding = self.processor(
+                images=images,
+                text=strings,
+                truncation=truncation,
+                padding="longest",
+                return_tensors="pt",
+                # **add_special_tokens, # TODO: at least some Processors error out when passing this. How do we control whether text gets BOS added?
+            )
+            encoding.to(  # TODO: our other tokenization methods in HFLM don't typically move to device. this breaks convention
+                self.device, self.model.dtype
+            )  # TODO: This only casts the pixel values. Should they always be float16?
+
         if left_truncate_len:
             encoding["input_ids"] = encoding["input_ids"][:, -left_truncate_len:]
             encoding["attention_mask"] = encoding["attention_mask"][
@@ -349,6 +423,16 @@ class HFMultimodalLM(HFLM):
             inputs["input_ids"].shape[1],
             inputs["input_ids"].shape[0],
         )
+
+        if "internvl" in self.model.name_or_path.lower():
+            return self.model.generate(
+                **inputs,
+                max_length=max_length,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=self.tokenizer.pad_token_id,
+                **generation_kwargs,
+            )
+        
         return self.model.generate(
             **inputs,
             max_length=max_length,
@@ -693,10 +777,9 @@ class HFMultimodalLM(HFLM):
             cont_toks_list = cont.tolist()
             for cont_toks, context in zip(cont_toks_list, contexts):
                 # discard context + left-padding toks if using causal decoder-only VLM
-                cont_toks = cont_toks[context_enc.shape[1] :]
-
+                if not ("internvl" in self.model.name_or_path.lower()):
+                    cont_toks = cont_toks[context_enc.shape[1] :]
                 s = self.tok_decode(cont_toks)
-
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
                 for term in until:
                     if len(term) > 0:
