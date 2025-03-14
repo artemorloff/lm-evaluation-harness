@@ -177,6 +177,7 @@ class HFLM(TemplateLM):
         )
 
         # load tokenizer so we know tokenizer vocabulary size before loading model and PEFT
+        print(revision)
         self._create_tokenizer(
             pretrained,
             tokenizer,
