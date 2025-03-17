@@ -19,11 +19,12 @@ from lm_eval.models.utils import (
 )
 
 
-DEFAULT_AUDIO_PLACEHOLDERS = ["<audio>", "<audio_1>", "<audio_2>"]
+DEFAULT_AUDIO_PLACEHOLDERS = ["<audio>"]
 
 HF_HOME = os.getenv("HF_HOME", "~/.cache/huggingface/")
 HF_TASK_CACHE_DIR = "audio_data"
 CACHE_PATH = os.path.join(os.path.expanduser(HF_HOME), HF_TASK_CACHE_DIR)
+
 
 @register_model("hf-audiolm-qwen")
 class HFAUDIOLMQWEN(HFLM):
@@ -61,7 +62,6 @@ class HFAUDIOLMQWEN(HFLM):
     ) -> None:
         """
         Helper method during initialization.
-
         For the multimodal variant, we initialize not just
         `self.tokenizer` but also `self.processor`.
         """
