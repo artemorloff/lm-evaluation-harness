@@ -1,9 +1,10 @@
 import copy
 import json
+import logging
 import os
-import soundfile as sf
 from typing import Dict, List, Optional, Tuple, Union
 
+import soundfile as sf
 import torch
 import transformers
 from tqdm import tqdm
@@ -24,6 +25,8 @@ DEFAULT_AUDIO_PLACEHOLDERS = ["<audio>"]
 HF_HOME = os.getenv("HF_HOME", "~/.cache/huggingface/")
 HF_TASK_CACHE_DIR = "audio_data"
 CACHE_PATH = os.path.join(os.path.expanduser(HF_HOME), HF_TASK_CACHE_DIR)
+
+eval_logger = logging.getLogger(__name__)
 
 
 @register_model("hf-audiolm-qwen")
@@ -312,7 +315,7 @@ class HFAUDIOLMQWEN(HFLM):
         raise NotImplementedError(
             "'loglikelihood' requests for model type `hf-audiolm` are not yet tested. This feature will be enabled when a loglikelihood-based multiple-choice VQA dataset is added!"
         )
-    
+
 
 @register_model("hf-audiolm-qwen-audio-chat")
 class HFAUDIOLM(HFLM):
@@ -322,7 +325,7 @@ class HFAUDIOLM(HFLM):
 
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
     MULTIMODAL = True  # flag to indicate, for now, that this model type can run multimodal requests
-    
+
     def __init__(
         self,
         pretrained: Union[str, transformers.PreTrainedModel],
@@ -369,43 +372,60 @@ class HFAUDIOLM(HFLM):
                 )  # TODO: check this condition
                 return tokenizer
 
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen-Audio-Chat", trust_remote_code=True)
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            pretrained, trust_remote_code=True
+        )
 
     def save_audio(self, audios):
         if not os.path.exists(CACHE_PATH):
             os.makedirs(CACHE_PATH)
-        for audio in audios:
-            sr = audio["sampling_rate"]
-            audio_name = audio["path"]
-            data = audio["array"]
-            audio_path_on_disk = os.path.join(CACHE_PATH, audio_name)
-            sf.write(audio_path_on_disk, data, sr)
-            audio["path"] = audio_path_on_disk
+        for idx, audio in enumerate(audios):
+            if isinstance(audio, dict):
+                sr = audio["sampling_rate"]
+                if audio.get("path", False):
+                    audio_name = audio["path"]
+                else:
+                    audio_name = f"audio_{idx}.wav"
+                data = audio["array"]
+                audio_path_on_disk = os.path.join(CACHE_PATH, audio_name)
+                sf.write(audio_path_on_disk, data, sr)
+                audio["path"] = audio_path_on_disk
+            elif isinstance(audio, str):
+                # assume str contains a path on disk
+                if os.path.isfile(audio):
+                    audios[idx] = {"path": audio}
+                else:
+                    # else should be href (there could be some check on href)
+                    audios[idx] = {"path": audio}
+            else:
+                raise ValueError(
+                    "Audio file should be presented as either a dict (with keys: array, sampling_rate, path) or string containing path to audio on disk (or href)"
+                )
         return audios
-    
-    def apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
+
+    def apply_chat_template(
+        self, chat_history: List[Dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
         """
         Method to apply a chat template to a list of chat history between user and model.
         """
         self.chat_applied = True
         for ch_h in chat_history:
             for placeholder in DEFAULT_AUDIO_PLACEHOLDERS:
-                ch_h["content"] = ch_h["content"].replace(placeholder,'')
+                ch_h["content"] = ch_h["content"].replace(placeholder, "")
 
         return json.dumps(chat_history, ensure_ascii=False)
-    
+
     def tok_batch_multimodal_encode(
         self,
         strings: List[str],  # note that input signature of this fn is different
-        audios: List[List], 
-
-    ) -> List[Dict]:  # note that this return signature differs from HFLM tok_batch_encode.
-
+        audios: List[List],
+    ) -> List[
+        Dict
+    ]:  # note that this return signature differs from HFLM tok_batch_encode.
         def _replace_placeholder(placeholder, strings):
             return [
-                replace_placeholders(
-                    string, placeholder, "", self.max_audios
-                )
+                replace_placeholders(string, placeholder, "", self.max_audios)
                 for string in strings
             ]
 
@@ -416,11 +436,10 @@ class HFAUDIOLM(HFLM):
         audios = self.save_audio(audios)
         encoded = self.tok_encode(strings[0])
 
-        query = [{'audio': audios[0]["path"]}, 
-                {'text': encoded[0]["content"]}]
+        query = [{"audio": audios[0]["path"]}, {"text": encoded[0]["content"]}]
 
         return query
-    
+
     def tok_encode(self, x):
         return json.loads(x)
 
@@ -457,11 +476,7 @@ class HFAUDIOLM(HFLM):
 
             audios = [arg["audio"][0] for arg in aux_arguments]
 
-
-            query = self.tok_batch_multimodal_encode(
-                contexts,
-                audios
-            )
+            query = self.tok_batch_multimodal_encode(contexts, audios)
 
             query = self.tokenizer.from_list_format(query)
             res, history = self.model.chat(self.tokenizer, query=query, history=None)
