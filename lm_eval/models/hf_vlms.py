@@ -20,10 +20,7 @@ from lm_eval.models.utils import (
     replace_placeholders,
     stop_sequences_criteria,
 )
-
-
-DEFAULT_IMAGE_PLACEHOLDER = "<image>"
-
+from lm_eval.api.task import DEFAULT_IMAGE_PLACEHOLDER
 
 eval_logger = logging.getLogger(__name__)
 
@@ -50,9 +47,11 @@ class HFMultimodalLM(HFLM):
         max_pixels: Optional[int] = None,
         **kwargs,
     ):
+        # init pixels before calling tokenizer creation to avoid errors
         self.pixels = ({"min_pixels": min_pixels} if min_pixels else {}) | (
             {"max_pixels": max_pixels} if max_pixels else {}
         )
+
         # We initialize using HFLM's init. Sub-methods like _create_model and _create_tokenizer
         # modify init behavior.
         super().__init__(pretrained, **kwargs)
@@ -69,7 +68,6 @@ class HFMultimodalLM(HFLM):
         self.interleave = interleave
         self.max_images = max_images
         self.rgb = convert_img_format
-
         # WARNING: improperly set image_token_id can lead to ignored image input or other (potentially silent) errors!
         if not image_string:
             self.image_token_id = (
