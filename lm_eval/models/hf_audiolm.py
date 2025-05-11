@@ -8,13 +8,13 @@ from transformers import BatchEncoding
 
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
+from lm_eval.api.task import DEFAULT_AUDIO_PLACEHOLDER
 from lm_eval.models.huggingface import HFLM
 from lm_eval.models.utils import (
     Collator,
     replace_placeholders,
     stop_sequences_criteria,
 )
-from lm_eval.api.task import DEFAULT_AUDIO_PLACEHOLDER
 
 
 @register_model("hf-audiolm-qwen")

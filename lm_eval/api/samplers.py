@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterable, Optional, Union
 import datasets
 from PIL import Image
 
+
 if TYPE_CHECKING:
     from random import Random
 
@@ -136,7 +137,9 @@ class ContextSampler:
             user_content.append(
                 {
                     "type": "image",
-                    "image": pil_image_to_bytes(image) if isinstance(image, Image.Image) else image
+                    "image": pil_image_to_bytes(image)
+                    if isinstance(image, Image.Image)
+                    else image,
                 }
             )
 
@@ -217,16 +220,18 @@ class ContextSampler:
             for doc in selected_docs:
                 doc_content = self.doc_to_text(doc)
                 doc_target = self.doc_to_target(doc)
-                user_text = doc_content \
-                    if self.config.doc_to_choice is None \
-                    or isinstance(doc_content, str) \
+                user_text = (
+                    doc_content
+                    if self.config.doc_to_choice is None or isinstance(doc_content, str)
                     else self.doc_to_choice(doc)[doc_content]
-                assistant_text = prefix + str(doc_target[0]) \
-                    if isinstance(doc_target, list) \
-                    else prefix + doc_target \
-                    if self.config.doc_to_choice is None \
-                    or isinstance(doc_target, str) \
+                )
+                assistant_text = (
+                    prefix + str(doc_target[0])
+                    if isinstance(doc_target, list)
+                    else prefix + doc_target
+                    if self.config.doc_to_choice is None or isinstance(doc_target, str)
                     else prefix + str(self.doc_to_choice(doc)[doc_target])
+                )
                 if pass_multimodal_args_to_chat_history:
                     user_content = [
                         {
@@ -260,7 +265,9 @@ class ContextSampler:
                 )
         else:
             # get fewshot context as one user turn
-            labeled_examples, multimodal_args = self.get_context(doc, num_fewshot, gen_prefix=gen_prefix)
+            labeled_examples, multimodal_args = self.get_context(
+                doc, num_fewshot, gen_prefix=gen_prefix
+            )
             user_content = [
                 {
                     "type": "text",
@@ -272,16 +279,11 @@ class ContextSampler:
                 user_content = self.update_user_content(
                     user_content,
                     images=multimodal_args.get("visuals"),
-                    audios=multimodal_args.get("audios")
+                    audios=multimodal_args.get("audios"),
                 )
                 multimodal_args = {}
 
-            chat_history.append(
-                {
-                    "role": "user",
-                    "content": user_content
-                }
-            )
+            chat_history.append({"role": "user", "content": user_content})
 
         return chat_history, multimodal_args
 
