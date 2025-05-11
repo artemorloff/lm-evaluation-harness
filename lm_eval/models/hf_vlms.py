@@ -5,12 +5,12 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 import transformers
-import numpy as np
 from tqdm import tqdm
 from transformers import BatchEncoding
 
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
+from lm_eval.api.task import DEFAULT_IMAGE_PLACEHOLDER
 from lm_eval.models.huggingface import HFLM
 from lm_eval.models.utils import (
     Collator,
@@ -20,7 +20,7 @@ from lm_eval.models.utils import (
     replace_placeholders,
     stop_sequences_criteria,
 )
-from lm_eval.api.task import DEFAULT_IMAGE_PLACEHOLDER
+
 
 eval_logger = logging.getLogger(__name__)
 
@@ -621,6 +621,7 @@ class HFMultimodalLM(HFLM):
             toks = self.tok_encode(x[0])
             return -len(toks), x[0]
 
+        print("REQS: ", requests)
         pbar = tqdm(
             total=len(requests),
             disable=(disable_tqdm or (self.rank != 0)),

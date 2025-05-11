@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from lm_eval import utils
 from lm_eval.api import samplers
-from lm_eval.api.instance import ContextInstance, Instance, OutputType
+from lm_eval.api.instance import Instance, OutputType
 from lm_eval.api.metrics import bits_per_byte, mean, weighted_perplexity
 from lm_eval.api.registry import (
     AGGREGATION_REGISTRY,
@@ -67,10 +67,6 @@ class TaskConfig(dict):
     dataset_path: Optional[str] = None
     dataset_name: Optional[str] = None
     dataset_kwargs: Optional[dict] = None
-    # context-based flag and funcs
-    context_based: Optional[bool] = None
-    request_updater: Optional[Callable] = None
-    storage_updater: Optional[Callable] = None
     training_split: Optional[str] = None
     validation_split: Optional[str] = None
     test_split: Optional[str] = None
@@ -199,36 +195,33 @@ def sort_multimedia_content_in_chat(
     audios = []
     for msg in messages:
         for item in msg["content"]:
-            if item["type"] == 'image':
+            if item["type"] == "image":
                 images.append(item)
-            elif item["type"] == 'audio':
+            elif item["type"] == "audio":
                 audios.append(item)
 
-    token_pattern = re.compile(
-        rf"({re.escape(image_token)}|{re.escape(audio_token)})"
-    )
+    token_pattern = re.compile(rf"({re.escape(image_token)}|{re.escape(audio_token)})")
 
     result = []
     for msg in messages:
         new_content = []
-        for item in msg.get('content', []):
-            if item.get('type') == 'text':
-                parts = token_pattern.split(item.get('text', ''))
+        for item in msg.get("content", []):
+            if item.get("type") == "text":
+                parts = token_pattern.split(item.get("text", ""))
                 for part in parts:
                     if part == image_token:
                         new_content.append(images.pop(0))
                     elif part == audio_token:
                         new_content.append(audios.pop(0))
                     elif part:
-                        new_content.append({'type': 'text', 'text': part})
+                        new_content.append({"type": "text", "text": part})
         if new_content:
-            result.append({
-                'role': msg.get('role'),
-                'content': new_content
-            })
+            result.append({"role": msg.get("role"), "content": new_content})
 
     if images or audios:
-        raise ValueError("Something went wrong, amount of image or audio placeholders in chat doesn't match true amount")
+        raise ValueError(
+            "Something went wrong, amount of image or audio placeholders in chat doesn't match true amount"
+        )
 
     return result
 
@@ -253,9 +246,6 @@ class Task(abc.ABC):
     DATASET_NAME: Optional[str] = None
 
     OUTPUT_TYPE: Optional[OutputType] = None
-
-    # defines meta-group of the task
-    CONTEXT_BASED: Optional[bool] = None
 
     def __init__(
         self,
@@ -784,12 +774,6 @@ class Task(abc.ABC):
             )
         return doc_iterator
 
-    def _update_request(self, request: ContextInstance, storage: Dict[Any, Any]):
-        return self.config.request_updater(request, storage)
-
-    def _update_storage(self, request: ContextInstance, storage: Dict[Any, Any]):
-        return self.config.storage_updater(request, storage)
-
 
 class ConfigurableTask(Task):
     VERSION = "Yaml"
@@ -846,9 +830,6 @@ class ConfigurableTask(Task):
 
         if self.config.dataset_name is not None:
             self.DATASET_NAME = self.config.dataset_name
-
-        # read context-based flag
-        self.CONTEXT_BASED = getattr(self.config, "context_based", False)
 
         self._metric_fn_list = {}
         self._metric_fn_kwargs = {}
@@ -1156,7 +1137,7 @@ class ConfigurableTask(Task):
         else:
             question_content = question
             gen_prefix_content = gen_prefix
-            
+
         if not fewshot_as_multiturn:
             # if no messages or last message is system, append as new user entry
             if len(labeled_examples) == 0 or labeled_examples[-1]["role"] == "system":
@@ -1168,7 +1149,9 @@ class ConfigurableTask(Task):
             # if fewshot_as_multiturn is True, append as next user entry (last is always assistant)
             labeled_examples.append({"role": "user", "content": question_content})
         if gen_prefix:
-            labeled_examples.append({"role": "assistant", "content": gen_prefix_content})
+            labeled_examples.append(
+                {"role": "assistant", "content": gen_prefix_content}
+            )
 
     @utils.positional_deprecated
     def fewshot_context(
@@ -1351,7 +1334,9 @@ class ConfigurableTask(Task):
             if isinstance(example, str):
                 return labeled_examples + example + prefix, multimodal_args
             elif isinstance(example, list):
-                return [labeled_examples + ex + prefix for ex in example], [multimodal_args] * len(example)
+                return [labeled_examples + ex + prefix for ex in example], [
+                    multimodal_args
+                ] * len(example)
             elif isinstance(example, int):
                 if self.config.doc_to_choice is not None:
                     choices = self.doc_to_choice(doc)
@@ -1564,20 +1549,6 @@ class ConfigurableTask(Task):
     def construct_requests(
         self, doc: dict, ctx: str, multimodal_args: dict = {}, **kwargs
     ) -> Union[List[Instance], Instance]:
-        # select instance type for the current task
-        # also add context funcs if necessary
-        instance_type = Instance
-        if self.CONTEXT_BASED:
-            instance_type = ContextInstance
-            # update kwargs with context parsing methods
-            kwargs = dict(
-                **kwargs,
-                **{
-                    "requests_updater": self._update_request,
-                    "storage_updater": self._update_storage,
-                },
-            )
-
         apply_chat_template = kwargs.pop("apply_chat_template", False)
         chat_template: Callable | None = kwargs.pop("chat_template", None)
 
@@ -1636,7 +1607,7 @@ class ConfigurableTask(Task):
 
         if self.OUTPUT_TYPE == "multiple_choice":
             request_list = [
-                instance_type(
+                Instance(
                     request_type="loglikelihood",
                     doc=doc,
                     arguments=arg,
@@ -1648,7 +1619,7 @@ class ConfigurableTask(Task):
 
             return request_list
 
-        return instance_type(
+        return Instance(
             request_type=self.OUTPUT_TYPE,
             doc=doc,
             arguments=arguments,
