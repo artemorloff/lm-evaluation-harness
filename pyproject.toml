@@ -61,6 +61,7 @@ api = ["requests", "aiohttp", "tenacity", "tqdm", "tiktoken"]
 audiolm_qwen = ["librosa", "soundfile"]
 deepsparse = ["deepsparse-nightly[llm]>=1.8.0.20240404"]
 dev = ["pytest", "pytest-cov", "pytest-xdist", "pre-commit", "mypy", "unitxt", "requests", "aiohttp", "tenacity", "tqdm", "tiktoken", "sentencepiece"]
+gigachat = ["gigachat"]
 gptq = ["auto-gptq[triton]>=0.6.0"]
 gptqmodel = ["gptqmodel>=1.0.9"]
 hf_transfer = ["hf_transfer"]
@@ -91,6 +92,7 @@ all = [
     "lm_eval[dev]",
     "lm_eval[gptq]",
     "lm_eval[gptqmodel]",
+    "lm_eval[gigachat]",
     "lm_eval[hf_transfer]",
     "lm_eval[ibm_watsonx_ai]",
     "lm_eval[ifeval]",
