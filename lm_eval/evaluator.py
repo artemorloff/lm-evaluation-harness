@@ -65,6 +65,7 @@ def simple_evaluate(
     evaluation_tracker: Optional[EvaluationTracker] = None,
     system_instruction: Optional[str] = None,
     apply_chat_template: Union[bool, str] = False,
+    pass_multimodal_args_to_chat_history: bool = False,
     fewshot_as_multiturn: bool = False,
     gen_kwargs: Union[str, dict, None] = None,
     task_manager: Optional[TaskManager] = None,
@@ -121,6 +122,9 @@ def simple_evaluate(
         - If set to True, the default chat template is applied.
         - If set to a string, applies the specified chat template by name.
         Defaults to False (no chat template applied).
+    :param pass_multimodal_args_to_chat_history
+        If true, pass multimodal bytes to chat_history,
+        so that chat_template would contain info about multimodal values
     :param fewshot_as_multiturn: bool
         Whether to provide the fewshot examples as a multiturn conversation or a single user turn.
     :param gen_kwargs: dict or comma-separated string
@@ -158,6 +162,11 @@ def simple_evaluate(
     ):
         eval_logger.warning(
             "Instruct model detected, but chat template not applied. Recommend setting `apply_chat_template` (optionally `fewshot_as_multiturn`)."
+        )
+
+    if not apply_chat_template and pass_multimodal_args_to_chat_history:
+        raise ValueError(
+            "It is impossible to pass multimodal args to chat history if you don't use apply_chat_template=True"
         )
 
     if delete_requests_cache:
@@ -347,6 +356,7 @@ def simple_evaluate(
         log_samples=True if predict_only else log_samples,
         system_instruction=system_instruction,
         apply_chat_template=apply_chat_template,
+        pass_multimodal_args_to_chat_history=pass_multimodal_args_to_chat_history,
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
@@ -410,6 +420,7 @@ def evaluate(
     log_samples: bool = True,
     system_instruction: Optional[str] = None,
     apply_chat_template: Union[bool, str] = False,
+    pass_multimodal_args_to_chat_history: bool = False,
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
@@ -441,6 +452,9 @@ def evaluate(
         - If set to True, the default chat template is applied.
         - If set to a string, applies the specified chat template by name.
         Defaults to False (no chat template applied).
+    :param pass_multimodal_args_to_chat_history
+        If true, pass multimodal bytes to chat_history,
+        so that chat_template would contain info about multimodal values
     :param fewshot_as_multiturn: bool
         Whether to provide the fewshot examples as a multiturn conversation or a single user turn.
     :param verbosity: str
@@ -457,6 +471,7 @@ def evaluate(
         )
     if samples is not None:
         eval_logger.info(f"Evaluating examples for tasks {list(samples.keys())}")
+
     if apply_chat_template:
         eval_logger.warning(
             "Chat template formatting change affects loglikelihood and multiple-choice tasks. See docs/chat-template-readme.md for details."
@@ -492,7 +507,7 @@ def evaluate(
     if len(incompatible_tasks) > 0:
         if not getattr(lm, "MULTIMODAL", False):
             raise ValueError(
-                f"Attempted to run tasks: {incompatible_tasks} which require multimodal input, but the selected model type does not currently implement this. Multimodal support is currently restricted to the ['hf-multimodal', 'vllm-vlm'] model type."
+                f"Attempted to run tasks: {incompatible_tasks} which require multimodal input, but the selected model type does not currently implement this. Multimodal support is currently restricted to the ['hf-multimodal', 'vllm-vlm', 'openai-chat-completions'] model type."
             )
         else:
             raise ValueError(
@@ -519,6 +534,7 @@ def evaluate(
             rewrite_requests_cache=rewrite_requests_cache,
             system_instruction=system_instruction,
             apply_chat_template=bool(apply_chat_template),
+            pass_multimodal_args_to_chat_history=pass_multimodal_args_to_chat_history,
             fewshot_as_multiturn=fewshot_as_multiturn,
             chat_template=getattr(lm, "apply_chat_template")
             if apply_chat_template
