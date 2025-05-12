@@ -1154,7 +1154,7 @@ class ConfigurableTask(Task):
                 chat_history, multimodal_args = self.sampler.get_chat_context(
                     doc,
                     num_fewshot,
-                    fewshot_as_multiturn,
+                    fewshot_as_multiturn=fewshot_as_multiturn,
                     gen_prefix=gen_prefix,
                 )
 
