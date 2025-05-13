@@ -808,6 +808,7 @@ class HFLM(TemplateLM):
         # default for None - empty dict, use predefined tokenizer param
         # used for all models except for CausalLM or predefined value
         special_tokens_kwargs = {}
+        print("STR: ", string)
 
         # by default for CausalLM - false or self.add_bos_token is set
         if add_special_tokens is None:

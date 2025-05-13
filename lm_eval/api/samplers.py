@@ -1,15 +1,26 @@
 import logging
 import warnings
 from functools import partial
+from io import BytesIO
 from typing import TYPE_CHECKING, Iterable, Optional, Union
 
 import datasets
+from PIL import Image
 
 
 if TYPE_CHECKING:
     from random import Random
 
     from lm_eval.api.task import ConfigurableTask, Task
+
+
+def pil_image_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
+    buf = BytesIO()
+    img.save(buf, format=fmt)
+    byte_data = buf.getvalue()
+    buf.close()
+    return byte_data
+
 
 eval_logger = logging.getLogger("lm-eval")
 
@@ -67,6 +78,28 @@ class ContextSampler:
         else:
             self.doc_to_choice = self.task.doc_to_choice
 
+        if (
+            self.config.fewshot_config is not None
+            and self.config.fewshot_config.get("doc_to_image", None) is not None
+        ):
+            self.doc_to_image = partial(
+                self.task.doc_to_image,
+                doc_to_image=self.config.fewshot_config.get("doc_to_image", None),
+            )
+        else:
+            self.doc_to_image = self.task.doc_to_image
+
+        if (
+            self.config.fewshot_config is not None
+            and self.config.fewshot_config.get("doc_to_audio", None) is not None
+        ):
+            self.doc_to_audio = partial(
+                self.task.doc_to_audio,
+                doc_to_audio=self.config.fewshot_config.get("doc_to_audio", None),
+            )
+        else:
+            self.doc_to_audio = self.task.doc_to_audio
+
         self.docs = docs  # HF dataset split, provided by task._fewshot_docs()
         if fewshot_indices:  # subset few-shot docs from
             if not isinstance(self.docs, datasets.Dataset):
@@ -75,9 +108,8 @@ class ContextSampler:
                 )
             self.docs = self.docs.select(fewshot_indices)
 
-    def get_context(self, doc: dict, num_fewshot: int, gen_prefix: str = None):
+    def _select_n_new_docs(self, doc: dict, num_fewshot: int):
         # draw an extra fewshot sample if using same split as evaluating on
-        prefix = gen_prefix + " " if gen_prefix else ""
         n_samples = (
             num_fewshot + 1
             if self.config.fewshot_split == self.config.test_split
@@ -91,7 +123,56 @@ class ContextSampler:
         # TODO: should we just stop people from using fewshot from same split as evaluating?
         selected_docs = [x for x in fewshotex if x != doc][:num_fewshot]
 
+        return selected_docs
+
+    def update_multimodal_args(self, multimodal_args, doc):
+        if self.config.doc_to_image:
+            multimodal_args.setdefault("visual", []).extend(self.doc_to_image(doc))
+        if self.config.doc_to_audio:
+            multimodal_args.setdefault("audio", []).extend(self.doc_to_audio(doc))
+        return multimodal_args
+
+    def update_user_content(self, user_content, doc=None, images=None, audios=None):
+        def add_image(image):
+            user_content.append(
+                {
+                    "type": "image",
+                    "image": pil_image_to_bytes(image)
+                    if isinstance(image, Image.Image)
+                    else image,
+                }
+            )
+
+        def add_audio(audio):
+            user_content.append(
+                {
+                    "type": "audio",
+                    "audio_url" if isinstance(audio, str) else "audio": audio,
+                }
+            )
+
+        if self.config.doc_to_image and doc:
+            for image in self.doc_to_image(doc):
+                add_image(image)
+        if images:
+            for image in images:
+                add_image(image)
+        if self.config.doc_to_audio and doc:
+            for audio in self.doc_to_audio(doc):
+                add_audio(audio)
+        if audios:
+            for audio in audios:
+                add_audio(audio)
+
+        return user_content
+
+    def get_context(self, doc: dict, num_fewshot: int, gen_prefix: str = None):
+        prefix = gen_prefix + " " if gen_prefix else ""
+        selected_docs = self._select_n_new_docs(doc, num_fewshot)
+
         labeled_examples = ""
+        multimodal_args = {}
+
         for doc in selected_docs:
             doc_content = self.doc_to_text(doc)
             doc_target = self.doc_to_target(doc)
@@ -118,68 +199,93 @@ class ContextSampler:
                     else str(self.doc_to_choice(doc)[doc_target])
                 )
                 labeled_examples += self.fewshot_delimiter
-
-        return labeled_examples
+            multimodal_args = self.update_multimodal_args(multimodal_args, doc)
+        return labeled_examples, multimodal_args
 
     def get_chat_context(
         self,
         doc: dict,
         num_fewshot: int,
+        pass_multimodal_args_to_chat_history: bool = False,
         fewshot_as_multiturn: bool = False,
         gen_prefix: Optional[str] = None,
     ):
         # TODO: Do we need any other delimiter
         prefix = gen_prefix + " " if gen_prefix else ""
         chat_history = []
-        # draw an extra fewshot sample if using same split as evaluating on
-        n_samples = (
-            num_fewshot + 1
-            if self.config.fewshot_split == self.config.test_split
-            else num_fewshot
-        )
-        # draw `n_samples` docs from fewshot_docs
-        fewshotex = self.sample(n_samples)
-
-        # get rid of the doc that's the one we're evaluating, if it's in the fewshot
-        # TODO: should we just stop people from using fewshot from same split as evaluating?
-        selected_docs = [x for x in fewshotex if x != doc][:num_fewshot]
+        multimodal_args = {}
+        selected_docs = self._select_n_new_docs(doc, num_fewshot)
 
         if fewshot_as_multiturn:
             for doc in selected_docs:
                 doc_content = self.doc_to_text(doc)
                 doc_target = self.doc_to_target(doc)
+                user_text = (
+                    doc_content
+                    if self.config.doc_to_choice is None or isinstance(doc_content, str)
+                    else self.doc_to_choice(doc)[doc_content]
+                )
+                assistant_text = (
+                    prefix + str(doc_target[0])
+                    if isinstance(doc_target, list)
+                    else prefix + doc_target
+                    if self.config.doc_to_choice is None or isinstance(doc_target, str)
+                    else prefix + str(self.doc_to_choice(doc)[doc_target])
+                )
+                if pass_multimodal_args_to_chat_history:
+                    user_content = [
+                        {
+                            "type": "text",
+                            "text": user_text,
+                        }
+                    ]
+                    user_content = self.update_user_content(user_content, doc)
+                    assistant_content = [
+                        {
+                            "type": "text",
+                            "text": assistant_text,
+                        }
+                    ]
+                else:
+                    user_content = user_text
+                    multimodal_args = self.update_multimodal_args(multimodal_args, doc)
+                    assistant_content = assistant_text
+
                 chat_history.append(
                     {
                         "role": "user",
-                        "content": doc_content
-                        if self.config.doc_to_choice is None
-                        or isinstance(doc_content, str)
-                        else self.doc_to_choice(doc)[doc_content],
+                        "content": user_content,
                     }
                 )
                 chat_history.append(
                     {
                         "role": "assistant",
-                        "content": prefix + str(doc_target[0])
-                        if isinstance(doc_target, list)
-                        else prefix + doc_target
-                        if self.config.doc_to_choice is None
-                        or isinstance(doc_target, str)
-                        else prefix + str(self.doc_to_choice(doc)[doc_target]),
+                        "content": assistant_content,
                     }
                 )
         else:
             # get fewshot context as one user turn
-            chat_history.append(
-                {
-                    "role": "user",
-                    "content": self.get_context(
-                        doc, num_fewshot, gen_prefix=gen_prefix
-                    ),
-                }
+            labeled_examples, multimodal_args = self.get_context(
+                doc, num_fewshot, gen_prefix=gen_prefix
             )
+            user_content = [
+                {
+                    "type": "text",
+                    "text": labeled_examples,
+                },
+            ]
 
-        return chat_history
+            if pass_multimodal_args_to_chat_history:
+                user_content = self.update_user_content(
+                    user_content,
+                    images=multimodal_args.get("visuals"),
+                    audios=multimodal_args.get("audios"),
+                )
+                multimodal_args = {}
+
+            chat_history.append({"role": "user", "content": user_content})
+
+        return chat_history, multimodal_args
 
     def sample(self, n: int):
         """
