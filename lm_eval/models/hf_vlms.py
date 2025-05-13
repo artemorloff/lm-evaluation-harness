@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 import transformers
+import numpy as np
 from tqdm import tqdm
 from transformers import BatchEncoding
 
@@ -19,10 +20,7 @@ from lm_eval.models.utils import (
     replace_placeholders,
     stop_sequences_criteria,
 )
-
-
-DEFAULT_IMAGE_PLACEHOLDER = "<image>"
-
+from lm_eval.api.task import DEFAULT_IMAGE_PLACEHOLDER
 
 eval_logger = logging.getLogger(__name__)
 
