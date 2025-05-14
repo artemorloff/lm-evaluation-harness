@@ -294,3 +294,13 @@ class OpenAIChatCompletion(LocalChatCompletion):
         elif "o3" in self.model:
             output.pop("temperature")
         return output
+
+
+@register_model("gigacode-chat-completions")
+class GigaCodeChatCompletion(OpenAIChatCompletion):
+    @cached_property
+    def header(self) -> dict:
+        return {
+            'Content-Type': 'application/json',
+            'X-API-KEY': self.api_key,
+        }
