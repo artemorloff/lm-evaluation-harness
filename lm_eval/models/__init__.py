@@ -18,6 +18,7 @@ from . import (
     sglang_causallms,
     sglang_generate_API,
     textsynth,
+    video_llava,
     vllm_causallms,
     vllm_vlms,
 )
