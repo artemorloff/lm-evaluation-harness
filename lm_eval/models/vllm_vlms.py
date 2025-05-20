@@ -12,10 +12,13 @@ from lm_eval.models.utils import (
     Collator,
     handle_stop_sequences,
     replace_placeholders,
+    resize_image,
     undistribute,
+    content_image_to_content_image_url,
 )
 from lm_eval.models.vllm_causallms import VLLM
 
+from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 eval_logger = logging.getLogger(__name__)
 
@@ -44,8 +47,20 @@ class VLLM_VLM(VLLM):
         interleave: bool = True,
         # TODO<baber>: handle max_images and limit_mm_per_prompt better
         max_images: int = 999,
+        image_width: Optional[int] = None,
+        image_height: Optional[int] = None,
+        image_max_side: Optional[int] = None,
         **kwargs,
     ):
+        self.image_width = image_width
+        self.image_height = image_height
+        self.image_max_side = image_max_side
+        if self.image_max_side and (self.image_width or self.image_height):
+            raise ValueError(
+                "Ambiguous config for image resize: you can not specify both "
+                "image_max_side and (image_width or image_height)"
+            )
+
         if max_images != 999:
             kwargs["limit_mm_per_prompt"] = {"image": max_images}
             eval_logger.info(f"Setting limit_mm_per_prompt[image] to {max_images}")
@@ -55,13 +70,15 @@ class VLLM_VLM(VLLM):
             revision=revision,
             **kwargs,
         )
+        if "phi-3.5" in pretrained and self.batch_size > 1:
+            raise ValueError("For phi-3.5 models only batch_size = 1 is now supported")
         self.interleave = interleave
         self.max_images = max_images
         self.processor = transformers.AutoProcessor.from_pretrained(
             pretrained,
             revision=revision,
             trust_remote_code=trust_remote_code,
-        )
+        ) if not isinstance(self.tokenizer, MistralTokenizer) else None
         self.chat_applied: bool = False
 
     def tok_batch_multimodal_encode(
@@ -99,6 +116,7 @@ class VLLM_VLM(VLLM):
         generate: bool = False,
         max_tokens: int = None,
         stop: Optional[List[str]] = None,
+        pass_multimodal_args_to_chat_history: Optional[bool] = False,
         **kwargs,
     ):
         if generate:
@@ -117,7 +135,8 @@ class VLLM_VLM(VLLM):
                 model_args: dict, sampling_params, requests: List[List[dict]]
             ):
                 llm = LLM(**model_args)
-                return llm.generate(requests, sampling_params=sampling_params)
+                fn = llm.chat if pass_multimodal_args_to_chat_history else llm.generate
+                return fn(requests, sampling_params=sampling_params)
 
             # dispatch requests to all self.data_parallel_size workers, in interleaved fashion
             # interleaved important to balance context lengths across workers
@@ -130,15 +149,17 @@ class VLLM_VLM(VLLM):
             # flatten results
             return undistribute(results)
 
+        fn = self.model.chat if pass_multimodal_args_to_chat_history else self.model.generate
+
         if self.lora_request is not None:
-            outputs = self.model.generate(
+            outputs = fn(
                 requests,
                 sampling_params=sampling_params,
                 use_tqdm=True if self.batch_size == "auto" else False,
                 lora_request=self.lora_request,
             )
         else:
-            outputs = self.model.generate(
+            outputs = fn(
                 requests,
                 sampling_params=sampling_params,
                 use_tqdm=True if self.batch_size == "auto" else False,
@@ -215,7 +236,10 @@ class VLLM_VLM(VLLM):
             #   padded context length. this is useful to simplify the batching logic and more importantly to make
             #   automatic adaptive batches much much easier to implement
             # - any OOMs will happen right away rather than near the end
-            toks = self.tok_encode(x[0])
+            if "phi-3.5" in self.model_args["model"].lower():
+                toks = []
+            else:
+                toks = self.tok_encode(copy.deepcopy(x[0]))
             return -len(toks), x[0]
 
         pbar = tqdm(
@@ -237,10 +261,23 @@ class VLLM_VLM(VLLM):
         chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
         eos = self.tokenizer.decode(self.eot_token_id)
         for chunk in chunks:
-            contexts, all_gen_kwargs, aux_arguments = zip(*chunk)
+            if len(chunk[0]) == 2:
+                contexts, all_gen_kwargs = zip(*chunk)
+                aux_arguments = []
+                pass_multimodal_args_to_chat_history = True
+            else:
+                pass_multimodal_args_to_chat_history = False
+                contexts, all_gen_kwargs, aux_arguments = zip(*chunk)
 
-            visuals = [arg["visual"] for arg in aux_arguments]
-
+            visuals = [
+                [
+                    resize_image(
+                        img, self.image_width, self.image_height, self.image_max_side
+                    )
+                    for img in arg["visual"]
+                ]
+                for arg in aux_arguments
+            ]
             if not isinstance(contexts, list):
                 contexts = list(
                     contexts
@@ -266,14 +303,31 @@ class VLLM_VLM(VLLM):
 
             max_ctx_len = self.max_length - max_gen_toks
 
-            inputs = self.tok_batch_multimodal_encode(
-                contexts,
-                visuals,
-                left_truncate_len=max_ctx_len,
-            )
+            if not pass_multimodal_args_to_chat_history:
+                inputs = self.tok_batch_multimodal_encode(
+                    contexts,
+                    visuals,
+                    left_truncate_len=max_ctx_len,
+                )
+            else:
+                inputs = []
+                for chat_history in contexts:
+                    new_chat_history = []
+                    for message in chat_history:
+                        new_content = []
+                        for content in message["content"]:
+                            new_content.append(content_image_to_content_image_url(content))
+                        message["content"] = new_content
+                        new_chat_history.append(message)
+                    inputs.append(new_chat_history)
 
             cont = self._model_generate(
-                inputs, stop=until, generate=True, max_tokens=max_gen_toks, **kwargs
+                inputs,
+                stop=until,
+                generate=True,
+                max_tokens=max_gen_toks,
+                pass_multimodal_args_to_chat_history=pass_multimodal_args_to_chat_history,
+                **kwargs
             )
 
             for output, context in zip(cont, contexts):

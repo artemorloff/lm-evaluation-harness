@@ -1,4 +1,6 @@
+import base64
 import collections
+import copy
 import fnmatch
 import gc
 import itertools
@@ -22,7 +24,9 @@ from typing import (
 
 import torch
 import transformers
+from PIL import Image
 
+from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 eval_logger = logging.getLogger(__name__)
 
@@ -641,6 +645,10 @@ def configure_pad_token(
     Raises:
         AssertionError: If the tokenizer is of type RWKVWorldTokenizer or Rwkv5Tokenizer and the padding token id is not 0.
     """
+    if isinstance(tokenizer, MistralTokenizer):
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        return tokenizer
+
     if tokenizer.pad_token:
         pass
     elif tokenizer.unk_token:
@@ -726,6 +734,62 @@ def handle_stop_sequences(
             f"Expected `kwargs['until']` to be of type Union[str,list] but got {until}"
         )
 
-    if eos is not None and eos not in until:
+    if eos is not None and eos not in until and eos:
         until.append(eos)
     return until
+
+
+def content_image_to_content_image_url(content):
+    if isinstance(content, str):
+        return content
+    if content["type"] != "image":
+        return content
+
+    new_content = copy.deepcopy(content)
+
+    b64 = base64.b64encode(new_content["image"]).decode("utf-8")
+    data_uri = f"data:image/png;base64,{b64}"
+
+    new_content["type"] = "image_url"
+    new_content["image_url"] = {
+        "url": data_uri,
+    }
+    del new_content["image"]
+
+    return new_content
+
+
+def resize_image(
+    image, input_image_width=None, input_image_height=None, input_image_max_side=None
+):
+    image_width, image_height = None, None
+    if input_image_width:
+        image_width = input_image_width
+    if input_image_height:
+        image_height = input_image_height
+
+    if image_width and image_height:
+        if image.width <= image_width and image.height <= image_height:
+            return image
+    elif image_width:
+        if image.width <= image_width:
+            return image
+        image_height = int((image.height / image.width) * image_width)
+    elif image_height:
+        if image.height <= image_height:
+            return image
+        image_width = int((image.width / image.height) * image_height)
+    elif input_image_max_side:
+        if max(image.height, image.width) <= input_image_max_side:
+            return image
+        elif image.height > image.width:
+            image_height = input_image_max_side
+            image_width = int((image.width / image.height) * image_height)
+        else:
+            image_width = input_image_max_side
+            image_height = int((image.height / image.width) * image_width)
+    else:
+        return image
+
+    image = image.resize((image_width, image_height), Image.BICUBIC)
+    return image

@@ -5,6 +5,7 @@ import random
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Union
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -65,6 +66,7 @@ def simple_evaluate(
     evaluation_tracker: Optional[EvaluationTracker] = None,
     system_instruction: Optional[str] = None,
     apply_chat_template: Union[bool, str] = False,
+    pass_multimodal_args_to_chat_history: bool = False,
     fewshot_as_multiturn: bool = False,
     gen_kwargs: Union[str, dict, None] = None,
     task_manager: Optional[TaskManager] = None,
@@ -121,6 +123,9 @@ def simple_evaluate(
         - If set to True, the default chat template is applied.
         - If set to a string, applies the specified chat template by name.
         Defaults to False (no chat template applied).
+    :param pass_multimodal_args_to_chat_history
+        If true, pass multimodal bytes to chat_history,
+        so that chat_template would contain info about multimodal values
     :param fewshot_as_multiturn: bool
         Whether to provide the fewshot examples as a multiturn conversation or a single user turn.
     :param gen_kwargs: dict or comma-separated string
@@ -158,6 +163,11 @@ def simple_evaluate(
     ):
         eval_logger.warning(
             "Instruct model detected, but chat template not applied. Recommend setting `apply_chat_template` (optionally `fewshot_as_multiturn`)."
+        )
+
+    if not apply_chat_template and pass_multimodal_args_to_chat_history:
+        raise ValueError(
+            "It is impossible to pass multimodal args to chat history if you don't use apply_chat_template=True"
         )
 
     if delete_requests_cache:
@@ -347,6 +357,7 @@ def simple_evaluate(
         log_samples=True if predict_only else log_samples,
         system_instruction=system_instruction,
         apply_chat_template=apply_chat_template,
+        pass_multimodal_args_to_chat_history=pass_multimodal_args_to_chat_history,
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
@@ -410,6 +421,7 @@ def evaluate(
     log_samples: bool = True,
     system_instruction: Optional[str] = None,
     apply_chat_template: Union[bool, str] = False,
+    pass_multimodal_args_to_chat_history: bool = False,
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
@@ -441,6 +453,9 @@ def evaluate(
         - If set to True, the default chat template is applied.
         - If set to a string, applies the specified chat template by name.
         Defaults to False (no chat template applied).
+    :param pass_multimodal_args_to_chat_history
+        If true, pass multimodal bytes to chat_history,
+        so that chat_template would contain info about multimodal values
     :param fewshot_as_multiturn: bool
         Whether to provide the fewshot examples as a multiturn conversation or a single user turn.
     :param verbosity: str
@@ -457,16 +472,29 @@ def evaluate(
         )
     if samples is not None:
         eval_logger.info(f"Evaluating examples for tasks {list(samples.keys())}")
+
+    # names of requests meta-types
+    CONTEXT_BASED_TYPE_ID = "context-based"
+    DEFAULT_TYPE_ID = "regular"
+    # name of the attribute inside task that allows using ctx
+    CONTEXT_BASED_TYPE_ATTR = "CONTEXT_BASED"
+
     if apply_chat_template:
         eval_logger.warning(
             "Chat template formatting change affects loglikelihood and multiple-choice tasks. See docs/chat-template-readme.md for details."
         )
+    ### prepare to split all requests into two meta-groups
     # tracks all Instances/requests a model must generate output on.
-    requests = defaultdict(list)
+    requests = {
+        CONTEXT_BASED_TYPE_ID: defaultdict(list),
+        DEFAULT_TYPE_ID: defaultdict(list),
+    }
     # stores the amount to pad out reqs per req. type so that
     # number of fwd passes per distributed rank is equal
-    padding_requests = defaultdict(int)
-
+    padding_requests = {
+        CONTEXT_BASED_TYPE_ID: defaultdict(int),
+        DEFAULT_TYPE_ID: defaultdict(int),
+    }
     # get lists of group hierarchy and each type of request
     eval_tasks = get_task_list(task_dict)
     if not log_samples:
@@ -492,7 +520,7 @@ def evaluate(
     if len(incompatible_tasks) > 0:
         if not getattr(lm, "MULTIMODAL", False):
             raise ValueError(
-                f"Attempted to run tasks: {incompatible_tasks} which require multimodal input, but the selected model type does not currently implement this. Multimodal support is currently restricted to the ['hf-multimodal', 'vllm-vlm'] model type."
+                f"Attempted to run tasks: {incompatible_tasks} which require multimodal input, but the selected model type does not currently implement this. Multimodal support is currently restricted to the ['hf-multimodal', 'vllm-vlm', 'openai-chat-completions'] model type."
             )
         else:
             raise ValueError(
@@ -519,6 +547,7 @@ def evaluate(
             rewrite_requests_cache=rewrite_requests_cache,
             system_instruction=system_instruction,
             apply_chat_template=bool(apply_chat_template),
+            pass_multimodal_args_to_chat_history=pass_multimodal_args_to_chat_history,
             fewshot_as_multiturn=fewshot_as_multiturn,
             chat_template=getattr(lm, "apply_chat_template")
             if apply_chat_template
@@ -532,11 +561,16 @@ def evaluate(
         )
         if write_out:
             print_writeout(task)
-        # aggregate Instances by LM method requested to get output.
+        # aggregate Instances by LM method requested to get output and req type also
+        task_type_id = (
+            CONTEXT_BASED_TYPE_ID
+            if getattr(task, CONTEXT_BASED_TYPE_ATTR, False)
+            else DEFAULT_TYPE_ID
+        )
         for instance in task.instances:
             reqtype = instance.request_type
-            requests[reqtype].append(instance)
-
+            # split requests into two groups: with and without context
+            requests[task_type_id][reqtype].append(instance)
         if lm.world_size > 1:
             instances_rnk = torch.tensor(len(task._instances), device=lm.device)
             gathered_item = (
@@ -551,30 +585,51 @@ def evaluate(
             # compute number of pseudo-batches to pad with (FSDP/DDP require even batches among ranks)
             numpad = max(gathered_item) - gathered_item[lm.rank]
             # todo: may not account for padding in cases like SquadV2 which has multiple req types
-            padding_requests[reqtype] += numpad
-
+            # pad each group separately
+            padding_requests[task_type_id][reqtype] += numpad
     ### Run LM on inputs, get all outputs ###
-    # execute each type of request
-    for reqtype, reqs in requests.items():
-        eval_logger.info(f"Running {reqtype} requests")
-        # create `K` copies of each request `req` based off `K = req.repeats`
-        cloned_reqs = []
-        for req in reqs:
-            cloned_reqs.extend([req] * req.repeats)
 
-        if (lm.world_size > 1) and (padding_requests[reqtype] > 0):
-            for _ in range(padding_requests[reqtype]):
+    # execute each group of request: ctx-based and regular
+    for task_type, type_requests in requests.items():
+        # for reqtype in a group
+        for reqtype, reqs in type_requests.items():
+            eval_logger.info(f"Running {reqtype} requests")
+            # create `K` copies of each request `req` based off `K = req.repeats`
+            cloned_reqs = []
+            for req in reqs:
                 cloned_reqs.extend([req] * req.repeats)
 
-        # run requests through model
-        resps = getattr(lm, reqtype)(cloned_reqs)
+            if (lm.world_size > 1) and (padding_requests[reqtype] > 0):
+                for _ in range(padding_requests[reqtype]):
+                    cloned_reqs.extend([req] * req.repeats)
 
-        # put responses from model into a list of length K for each request.
-        for x, req in zip(resps, cloned_reqs):
-            req.resps.append(x)
+            # regular requests are left untouched
+            if task_type == DEFAULT_TYPE_ID:
+                # run all requests through model
+                resps = getattr(lm, reqtype)(cloned_reqs)
 
-        if lm.world_size > 1:
-            lm.accelerator.wait_for_everyone()
+                # put responses from model into a list of length K for each request.
+                for x, req in zip(resps, cloned_reqs):
+                    req.resps.append(x)
+            # context tasks require separate reqs processing
+            else:
+                # needed to store lm outputs
+                storage = {}
+                # iterate over all requests
+                # this tqdm does not overwrite internal tqdms of getattr(lm, reqtype)
+                for req in tqdm(cloned_reqs, desc=f"Running {reqtype} requests"):
+                    # one request per iteration, each time update req.args
+                    req = req.update_request(storage, req)
+                    # only one resp for a single request
+                    resp = getattr(lm, reqtype)([req])
+                    # simultaneously add output to the Instance attr
+                    req.resps.extend(resp)
+                    # push changes into storage
+                    # also discard storage after the current set ends
+                    storage = req.update_storage(storage, req)
+
+            if lm.world_size > 1:
+                lm.accelerator.wait_for_everyone()
 
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
@@ -637,7 +692,7 @@ def evaluate(
                                 ensure_ascii=False,
                             )
                         ),
-                        "prompt_hash": hash_string(requests[0].arguments[0]),
+                        "prompt_hash": hash_string(str(requests[0].arguments[0])),
                         "target_hash": hash_string(str(target)),
                     }
                     example.update(metrics)

@@ -34,6 +34,8 @@ try:
 except ModuleNotFoundError:
     pass
 
+from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
+
 if TYPE_CHECKING:
     pass
 
@@ -138,7 +140,7 @@ class VLLM(TemplateLM):
                 "Found 'gemma' in model name, a BOS token will be used as Gemma series models underperform without it."
             )
 
-        if parse_version(version("vllm")) >= parse_version("0.8.3"):
+        if parse_version(version("vllm")) >= parse_version("0.8.3") and not isinstance(self.tokenizer, MistralTokenizer):
             self.hf_chat_template = resolve_hf_chat_template(
                 tokenizer=self.tokenizer,
                 chat_template=None,
@@ -229,12 +231,21 @@ class VLLM(TemplateLM):
     ) -> Union[List[int], List[List[int]]]:
         if not add_special_tokens:
             add_special_tokens = False or self.add_bos_token
-        encoding: Union[List[List[int]], List[int]] = self.tokenizer(
-            string,
-            add_special_tokens=add_special_tokens,
-            truncation=truncation,
-            return_attention_mask=False,
-        ).input_ids
+        if isinstance(string, str) or isinstance(string[0], str):
+            encoding: Union[List[List[int]], List[int]] = self.tokenizer(
+                string,
+                add_special_tokens=add_special_tokens,
+                truncation=truncation,
+                return_attention_mask=False,
+            ).input_ids
+        else:
+            # It must be a formatted chat history dict then
+            encoding: Union[List[List[int]], List[int]] = self.tokenizer.apply_chat_template(
+                string,
+                add_special_tokens=add_special_tokens,
+                truncation=truncation,
+                return_attention_mask=False,
+            )
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
