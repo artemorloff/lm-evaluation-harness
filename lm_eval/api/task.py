@@ -25,7 +25,10 @@ import datasets
 import numpy as np
 from tqdm import tqdm
 
-from torchvision.transforms.functional import to_pil_image
+try:
+    from torchvision.transforms.functional import to_pil_image
+except ModuleNotFoundError:
+    pass
 
 import io
 import base64

@@ -38,7 +38,7 @@ from io import BytesIO
 from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
-from lm_eval.models.utils import Collator, chunks, configure_pad_token
+from lm_eval.models.utils import Collator, chunks, configure_pad_token, content_image_to_content_image_url
 
 
 if TYPE_CHECKING:
@@ -101,7 +101,7 @@ def create_image_prompt(
     return chat
 
 
-class TemplateAPI(TemplateLM):
+class TemplateAPIMERA(TemplateLM):
     MULTIMODAL = True
 
     def __init__(
@@ -451,6 +451,22 @@ class TemplateAPI(TemplateLM):
         elif self.tokenizer_backend == "remote":
             return self.tokenizer.batch_decode(tokens)
 
+    def normalize_payload(self, payload):
+        is_list = isinstance(payload, list)
+        if not is_list:
+            result = [copy.deepcopy(payload)]
+        else:
+            result = copy.deepcopy(payload)
+
+        for el in result:
+            for message in el["messages"]:
+                for i, content in enumerate(message["content"]):
+                    message["content"][i] = content_image_to_content_image_url(content)
+
+        if is_list:
+            return result
+        return result[0]
+
     def model_call(
         self,
         messages: Union[List[List[int]], List[str], List[JsonChatStr]],
@@ -462,18 +478,22 @@ class TemplateAPI(TemplateLM):
         # !!! Copy: shared dict for each request, need new object !!!
         gen_kwargs = copy.deepcopy(gen_kwargs)
         try:
-            response = requests.post(
-                self.base_url,
-                json=self._create_payload(
+            payload = self.normalize_payload(
+                self._create_payload(
                     self.create_message(messages),
                     generate=generate,
                     gen_kwargs=gen_kwargs,
                     seed=self._seed,
                     eos=self.eos_string,
                     **kwargs,
-                ),
+                )
+            )
+            response = requests.post(
+                self.base_url,
+                json=payload,
                 headers=self.header,
                 verify=self.verify_certificate,
+                timeout=60,
             )
             if not response.ok:
                 eval_logger.warning(
@@ -501,12 +521,14 @@ class TemplateAPI(TemplateLM):
     ) -> Union[List[str], List[Tuple[float, bool]], None]:
         # !!! Copy: shared dict for each request, need new object !!!
         gen_kwargs = copy.deepcopy(gen_kwargs)
-        payload = self._create_payload(
-            self.create_message(messages),
-            generate=generate,
-            gen_kwargs=gen_kwargs,
-            seed=self._seed,
-            **kwargs,
+        payload = self.normalize_payload(
+            self._create_payload(
+                self.create_message(messages),
+                generate=generate,
+                gen_kwargs=gen_kwargs,
+                seed=self._seed,
+                **kwargs,
+            )
         )
         cache_method = "generate_until" if generate else "loglikelihood"
         acquired = await sem.acquire()
@@ -542,7 +564,7 @@ class TemplateAPI(TemplateLM):
             return answers
         # If the retries also fail
         except BaseException as e:
-            eval_logger.error(f"Exception:{repr(e)}, {outputs}, retrying.")
+            eval_logger.error(f"Exception:{repr(e)}, retrying.")
             raise e
         finally:
             if acquired:

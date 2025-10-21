@@ -51,8 +51,8 @@ eval_logger = logging.getLogger(__name__)
 TOKENIZER_INFINITY = 1000000000000000019884624838656
 
 
-@register_model("hf-auto", "hf", "huggingface")
-class HFLM(TemplateLM):
+@register_model("hf-auto-mera", "hf-mera", "huggingface-mera")
+class HFLMMERA(TemplateLM):
     """An abstracted Huggingface model class. Enables usage with both models of
     `transformers.AutoModelForCausalLM` and `transformers.AutoModelForSeq2SeqLM` classes.
 

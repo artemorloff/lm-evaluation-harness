@@ -5,12 +5,13 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 import transformers
+import numpy as np
 from tqdm import tqdm
 from transformers import BatchEncoding
 
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
-from lm_eval.models.huggingface import HFLM
+from lm_eval.models.huggingface_mera import HFLMMERA
 from lm_eval.models.utils import (
     Collator,
     flatten_image_list,
@@ -20,16 +21,13 @@ from lm_eval.models.utils import (
     resize_image,
     stop_sequences_criteria,
 )
-
-
-DEFAULT_IMAGE_PLACEHOLDER = "<image>"
-
+from lm_eval.api.task import DEFAULT_IMAGE_PLACEHOLDER
 
 eval_logger = logging.getLogger(__name__)
 
 
-@register_model("hf-multimodal")
-class HFMultimodalLM(HFLM):
+@register_model("hf-multimodal-mera")
+class HFMultimodalLMMERA(HFLMMERA):
     """
     An abstracted Hugging Face model class for multimodal LMs like Llava and Idefics.
     """

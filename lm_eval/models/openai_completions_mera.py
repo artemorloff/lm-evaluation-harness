@@ -5,15 +5,15 @@ from operator import itemgetter
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from lm_eval.api.registry import register_model
-from lm_eval.models.api_models import TemplateAPI
+from lm_eval.models.api_models_mera import TemplateAPIMERA
 from lm_eval.models.utils import handle_stop_sequences
 
 
 eval_logger = logging.getLogger(__name__)
 
 
-@register_model("local-completions")
-class LocalCompletionsAPI(TemplateAPI):
+@register_model("local-completions-mera")
+class LocalCompletionsAPIMERA(TemplateAPIMERA):
     def __init__(
         self,
         base_url=None,
@@ -138,8 +138,8 @@ class LocalCompletionsAPI(TemplateAPI):
         return os.environ.get("OPENAI_API_KEY", "")
 
 
-@register_model("local-chat-completions")
-class LocalChatCompletion(LocalCompletionsAPI):
+@register_model("local-chat-completions-mera")
+class LocalChatCompletionMERA(LocalCompletionsAPIMERA):
     """
     Minimal chat-completions wrapper.
     - Only accepts messages as list[dict].
@@ -150,8 +150,6 @@ class LocalChatCompletion(LocalCompletionsAPI):
     def __init__(
         self,
         base_url=None,
-        tokenizer_backend=None,
-        tokenized_requests=None,
         verify_certificate=True,
         ca_cert_path=None,
         auth_token=None,
@@ -159,8 +157,8 @@ class LocalChatCompletion(LocalCompletionsAPI):
     ):
         super().__init__(
             base_url=base_url,
-            tokenizer_backend=tokenizer_backend,
-            tokenized_requests=tokenized_requests,
+            tokenizer_backend=None,
+            tokenized_requests=None,
             verify_certificate=verify_certificate,
             ca_cert_path=ca_cert_path,
             auth_token=auth_token,
@@ -235,9 +233,9 @@ class LocalChatCompletion(LocalCompletionsAPI):
 
 
 @register_model(
-    "openai-completions",
+    "openai-completions-mera",
 )
-class OpenAICompletionsAPI(LocalCompletionsAPI):
+class OpenAICompletionsAPIMERA(LocalCompletionsAPIMERA):
     def __init__(
         self,
         base_url="https://api.openai.com/v1/completions",
@@ -271,8 +269,10 @@ class OpenAICompletionsAPI(LocalCompletionsAPI):
         return ""
 
 
-@register_model("openai-chat-completions")
-class OpenAIChatCompletion(LocalChatCompletion):
+@register_model("openai-chat-completions-mera")
+class OpenAIChatCompletionMERA(LocalChatCompletionMERA):
+    MULTIMODAL = True
+
     def __init__(
         self,
         base_url="https://api.openai.com/v1/chat/completions",
@@ -337,12 +337,9 @@ class OpenAIChatCompletion(LocalChatCompletion):
             "seed": seed,
             **gen_kwargs,
         }
-        if (
-            "o1" in self.model
-            or "5" in self.model
-            or "o3" in self.model
-            or "o4" in self.model
-        ):
+        if "o1" in self.model or "5" in self.model:
             output.pop("stop")
             output["temperature"] = 1
+        elif "o3" in self.model:
+            output.pop("temperature")
         return output
