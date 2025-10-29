@@ -16,6 +16,8 @@ from datasets.features._torchcodec import AudioDecoder
 
 # Imports for video caching
 from torchcodec.decoders._video_decoder import VideoDecoder
+import decord
+import torchvision.io as tvio
 
 from tqdm import tqdm
 
@@ -238,6 +240,21 @@ class MultiModalEncoder(json.JSONEncoder):
             # Convert video to base64 string for caching
             # Use only first, middle and last frame from video for caching to reduce computation overhead
             torch.save(obj.get_frames_at([0, int(len(obj) * 0.5), len(obj) - 1]), buffered)
+        if isinstance(obj, decord.VideoReader):
+            # Convert video to base64 string for caching
+            # Use only first, middle and last frame from video for caching to reduce computation overhead
+            torch.save(obj.get_batch([0, int(len(obj) * 0.5), len(obj) - 1]), buffered)
+        if isinstance(obj, tvio.VideoReader):
+            # Convert video to base64 string for caching
+            # Use only first 3 frames from video for caching to reduce computation overhead
+            frames_to_cache = 3
+            frames = []
+            for frame in obj:
+                frames.append(frame["data"])
+                if len(frames) == frames_to_cache:
+                    break
+            frames = torch.stack(frames)
+            torch.save(frames, buffered)
         obj_str = base64.b64encode(buffered.getvalue()).decode()
         if obj_str:
             return f"obj_base64:{obj_str}"
