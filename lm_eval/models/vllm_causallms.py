@@ -42,8 +42,6 @@ try:
 except ModuleNotFoundError:
     pass
 
-from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
-
 if TYPE_CHECKING:
     pass
 
@@ -52,7 +50,7 @@ eval_logger = logging.getLogger(__name__)
 
 def _vllm_mp_worker(
     model_args: dict,
-    sampling_params: "list[SamplingParams]",
+    sampling_params: list["SamplingParams"],
     requests: list[list[int]],
     lora_request: "LoRARequest",
     result_queue: "Queue",
@@ -346,21 +344,12 @@ class VLLM(TemplateLM):
     ) -> Union[List[int], List[List[int]]]:
         if not add_special_tokens:
             add_special_tokens = False or self.add_bos_token
-        if isinstance(string, str) or isinstance(string[0], str):
-            encoding: Union[List[List[int]], List[int]] = self.tokenizer(
-                string,
-                add_special_tokens=add_special_tokens,
-                truncation=truncation,
-                return_attention_mask=False,
-            ).input_ids
-        else:
-            # It must be a formatted chat history dict then
-            encoding: Union[List[List[int]], List[int]] = self.tokenizer.apply_chat_template(
-                string,
-                add_special_tokens=add_special_tokens,
-                truncation=truncation,
-                return_attention_mask=False,
-            )
+        encoding: Union[List[List[int]], List[int]] = self.tokenizer(
+            string,
+            add_special_tokens=add_special_tokens,
+            truncation=truncation,
+            return_attention_mask=False,
+        ).input_ids
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
@@ -375,7 +364,7 @@ class VLLM(TemplateLM):
         self,
         requests: List[List[int]] = None,
         generate: bool = False,
-        sampling_params: Union[List[SamplingParams], SamplingParams, None] = None,
+        sampling_params: Union[List["SamplingParams"], "SamplingParams", None] = None,
     ):
         if not generate or sampling_params is None:
             sampling_params = SamplingParams(
@@ -390,9 +379,9 @@ class VLLM(TemplateLM):
             @ray.remote
             def run_inference_one_model(
                 model_args: dict,
-                sampling_params: List[SamplingParams],
+                sampling_params: List["SamplingParams"],
                 requests: List[List[int]],
-                lora_request: LoRARequest,
+                lora_request: "LoRARequest",
             ):
                 llm = LLM(**model_args)
                 return llm.generate(
@@ -430,7 +419,7 @@ class VLLM(TemplateLM):
             procs, resq = [], Queue()
             # We use Process as it is non-daemonic
             try:
-                for rank, (sp, req) in enumerate(zip(requests, sampling_params)):
+                for rank, (req, sp) in enumerate(zip(requests, sampling_params)):
                     proc = Process(
                         target=_vllm_mp_worker,
                         args=(
