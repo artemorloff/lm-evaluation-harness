@@ -26,7 +26,6 @@ import torch
 import transformers
 from PIL import Image
 
-from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 eval_logger = logging.getLogger(__name__)
 
@@ -650,9 +649,14 @@ def configure_pad_token(
     Raises:
         AssertionError: If the tokenizer is of type RWKVWorldTokenizer or Rwkv5Tokenizer and the padding token id is not 0.
     """
-    if isinstance(tokenizer, MistralTokenizer):
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-        return tokenizer
+    try:
+        from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
+
+        if isinstance(tokenizer, MistralTokenizer):
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+            return tokenizer
+    except ModuleNotFoundError:
+        pass
 
     if tokenizer.pad_token:
         pass

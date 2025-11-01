@@ -24,8 +24,8 @@ from lm_eval.api.task import DEFAULT_VIDEO_PLACEHOLDER
 eval_logger = logging.getLogger(__name__)
 
 
-@register_model("hf_videolm")
-class HFVideoLlava(HFMultimodalLM):
+@register_model("hf-videolm-mera")
+class HFVideoLlavaMERA(HFMultimodalLM):
     MULTIMODAL = True
     AUTO_MODEL_CLASS = AutoModelForVision2Seq
 
