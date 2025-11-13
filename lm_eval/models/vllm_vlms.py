@@ -16,7 +16,7 @@ from lm_eval.models.utils import (
     undistribute,
     content_image_to_content_image_url,
 )
-from lm_eval.models.vllm_causallms import VLLM
+from lm_eval.models.vllm_causallms import VLLM, VLLMMERA
 
 from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
@@ -70,15 +70,13 @@ class VLLM_VLM(VLLM):
             revision=revision,
             **kwargs,
         )
-        if "phi-3.5" in pretrained and self.batch_size > 1:
-            raise ValueError("For phi-3.5 models only batch_size = 1 is now supported")
         self.interleave = interleave
         self.max_images = max_images
         self.processor = transformers.AutoProcessor.from_pretrained(
             pretrained,
             revision=revision,
             trust_remote_code=trust_remote_code,
-        ) if not isinstance(self.tokenizer, MistralTokenizer) else None
+        )
         self.chat_applied: bool = False
 
     def tok_batch_multimodal_encode(
@@ -116,7 +114,6 @@ class VLLM_VLM(VLLM):
         generate: bool = False,
         max_tokens: int = None,
         stop: Optional[List[str]] = None,
-        pass_multimodal_args_to_chat_history: Optional[bool] = False,
         **kwargs,
     ):
         if generate:
@@ -135,8 +132,7 @@ class VLLM_VLM(VLLM):
                 model_args: dict, sampling_params, requests: List[List[dict]]
             ):
                 llm = LLM(**model_args)
-                fn = llm.chat if pass_multimodal_args_to_chat_history else llm.generate
-                return fn(requests, sampling_params=sampling_params)
+                return llm.generate(requests, sampling_params=sampling_params)
 
             # dispatch requests to all self.data_parallel_size workers, in interleaved fashion
             # interleaved important to balance context lengths across workers
@@ -149,17 +145,15 @@ class VLLM_VLM(VLLM):
             # flatten results
             return undistribute(results)
 
-        fn = self.model.chat if pass_multimodal_args_to_chat_history else self.model.generate
-
         if self.lora_request is not None:
-            outputs = fn(
+            outputs = self.model.generate(
                 requests,
                 sampling_params=sampling_params,
                 use_tqdm=True if self.batch_size == "auto" else False,
                 lora_request=self.lora_request,
             )
         else:
-            outputs = fn(
+            outputs = self.model.generate(
                 requests,
                 sampling_params=sampling_params,
                 use_tqdm=True if self.batch_size == "auto" else False,
@@ -226,10 +220,173 @@ class VLLM_VLM(VLLM):
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
-        ### HERE ###
-        # if requests and len(requests[0].args) < 3:
-        #     # Fall back to non-multimodal generation.
-        #     return super().generate_until(requests=requests, disable_tqdm=disable_tqdm)
+        if requests and len(requests[0].args) < 3:
+            # Fall back to non-multimodal generation.
+            return super().generate_until(requests=requests, disable_tqdm=disable_tqdm)
+
+        res = []
+
+        def _collate(x):
+            # the negative sign on len(toks) sorts descending - this has a few advantages:
+            # - time estimates will always be over not underestimates, which is more useful for planning
+            # - to know the size of a batch when going through the list, you know the first one is always the batch
+            #   padded context length. this is useful to simplify the batching logic and more importantly to make
+            #   automatic adaptive batches much much easier to implement
+            # - any OOMs will happen right away rather than near the end
+            toks = self.tok_encode(x[0])
+            return -len(toks), x[0]
+
+        pbar = tqdm(
+            total=len(requests),
+            disable=(disable_tqdm or (self.rank != 0)),
+            desc="Running generate_until requests with text+image input",
+        )
+        # TODO: port auto-batch sizing into this.
+
+        # we group requests by their generation_kwargs,
+        # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
+        # in the same batch.
+        re_ords = Collator(
+            [reg.args for reg in requests],
+            _collate,
+            group_by="gen_kwargs",
+            group_fn=lambda x: x[1],
+        )
+        chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
+        eos = self.tokenizer.decode(self.eot_token_id)
+        for chunk in chunks:
+            contexts, all_gen_kwargs, aux_arguments = zip(*chunk)
+
+            visuals = [
+                [
+                    resize_image(
+                        img, self.image_width, self.image_height, self.image_max_side
+                    )
+                    for img in arg["visual"]
+                ]
+                for arg in aux_arguments
+            ]
+
+            if not isinstance(contexts, list):
+                contexts = list(
+                    contexts
+                )  # for Qwen2-VL, processor is unhappy accepting a tuple of strings instead of a list.
+                # TODO: could we upstream this workaround to HF?
+
+            # we assume all gen kwargs in the batch are the same
+            # this is safe to assume because the `grouper` object ensures it.
+            gen_kwargs = all_gen_kwargs[0]
+            # unpack our keyword arguments.
+            if isinstance(gen_kwargs, dict):
+                kwargs = copy.deepcopy(gen_kwargs)  # edge case for repeats > 1
+                # add EOS token to stop sequences
+                until = handle_stop_sequences(kwargs.pop("until", None), eos=eos)
+            else:
+                raise ValueError(
+                    f"Expected `kwargs` to be of type `dict` but got {type(gen_kwargs)}"
+                )
+            if "max_gen_toks" in kwargs.keys():
+                max_gen_toks = kwargs.pop("max_gen_toks")
+            else:
+                max_gen_toks = self.max_gen_toks
+
+            max_ctx_len = self.max_length - max_gen_toks
+
+            inputs = self.tok_batch_multimodal_encode(
+                contexts,
+                visuals,
+                left_truncate_len=max_ctx_len,
+            )
+
+            cont = self._multimodal_model_generate(
+                inputs, stop=until, generate=True, max_tokens=max_gen_toks, **kwargs
+            )
+
+            for output, context in zip(cont, contexts):
+                generated_text = output.outputs[0].text
+                res.append(generated_text)
+                self.cache_hook.add_partial(
+                    "generate_until", (context, gen_kwargs), generated_text
+                )
+                pbar.update(1)
+        # reorder this group of results back to original unsorted form
+        res = re_ords.get_original(res)
+
+        pbar.close()
+        return res
+
+    def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
+        if requests and len(requests[0].args) < 3:
+            # Fall back to non-multimodal generation.
+            return super().loglikelihood_rolling(requests=requests)
+        raise NotImplementedError(
+            "model type `vllm-vlm` does not support loglikelihood_rolling. Use 'vlm' model type for text-only loglikelihood_rolling tasks ",
+            "this is because we do not support measuring the loglikelihood a model assigns to an image.",
+        )
+    
+@register_model("vllm-vlm-mera")
+class VLLM_VLMMERA(VLLM_VLM, VLLMMERA):
+
+    def _multimodal_model_generate(
+        self,
+        requests: List[List[dict]] = None,
+        generate: bool = False,
+        max_tokens: int = None,
+        stop: Optional[List[str]] = None,
+        pass_multimodal_args_to_chat_history: Optional[bool] = False,
+        **kwargs,
+    ):
+        if generate:
+            kwargs = self.modify_gen_kwargs(kwargs)
+            sampling_params = SamplingParams(max_tokens=max_tokens, stop=stop, **kwargs)
+        else:
+            sampling_params = SamplingParams(
+                temperature=0, prompt_logprobs=1, max_tokens=1, detokenize=False
+            )
+        if self.data_parallel_size > 1:
+            # vLLM hangs if resources are set in ray.remote
+            # also seems to only work with decorator and not with ray.remote() fn
+            # see https://github.com/vllm-project/vllm/issues/973
+            @ray.remote
+            def run_inference_one_model(
+                model_args: dict, sampling_params, requests: List[List[dict]]
+            ):
+                llm = LLM(**model_args)
+                fn = llm.chat if pass_multimodal_args_to_chat_history else llm.generate
+                return fn(requests, sampling_params=sampling_params)
+
+            # dispatch requests to all self.data_parallel_size workers, in interleaved fashion
+            # interleaved important to balance context lengths across workers
+            requests = [list(x) for x in distribute(self.data_parallel_size, requests)]
+            inputs = ((self.model_args, sampling_params, req) for req in requests)
+            object_refs = [run_inference_one_model.remote(*x) for x in inputs]
+            results = ray.get(object_refs)
+            # Invoke ray.shutdown() to prevent hang-ups if subsequent calls required.
+            ray.shutdown()
+            # flatten results
+            return undistribute(results)
+
+        fn = self.model.chat if pass_multimodal_args_to_chat_history else self.model.generate
+
+        if self.lora_request is not None:
+            outputs = fn(
+                requests,
+                sampling_params=sampling_params,
+                use_tqdm=True if self.batch_size == "auto" else False,
+                lora_request=self.lora_request,
+            )
+        else:
+            outputs = fn(
+                requests,
+                sampling_params=sampling_params,
+                use_tqdm=True if self.batch_size == "auto" else False,
+            )
+        return outputs
+
+
+    def generate_until(
+        self, requests: List[Instance], disable_tqdm: bool = False
+    ) -> List[str]:
 
         res = []
 
@@ -341,12 +498,3 @@ class VLLM_VLM(VLLM):
 
         pbar.close()
         return res
-
-    def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
-        if requests and len(requests[0].args) < 3:
-            # Fall back to non-multimodal generation.
-            return super().loglikelihood_rolling(requests=requests)
-        raise NotImplementedError(
-            "model type `vllm-vlm` does not support loglikelihood_rolling. Use 'vlm' model type for text-only loglikelihood_rolling tasks ",
-            "this is because we do not support measuring the loglikelihood a model assigns to an image.",
-        )

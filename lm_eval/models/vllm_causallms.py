@@ -42,7 +42,6 @@ try:
 except ModuleNotFoundError:
     pass
 
-from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 if TYPE_CHECKING:
     pass
@@ -346,21 +345,12 @@ class VLLM(TemplateLM):
     ) -> Union[List[int], List[List[int]]]:
         if not add_special_tokens:
             add_special_tokens = False or self.add_bos_token
-        if isinstance(string, str) or isinstance(string[0], str):
-            encoding: Union[List[List[int]], List[int]] = self.tokenizer(
-                string,
-                add_special_tokens=add_special_tokens,
-                truncation=truncation,
-                return_attention_mask=False,
-            ).input_ids
-        else:
-            # It must be a formatted chat history dict then
-            encoding: Union[List[List[int]], List[int]] = self.tokenizer.apply_chat_template(
-                string,
-                add_special_tokens=add_special_tokens,
-                truncation=truncation,
-                return_attention_mask=False,
-            )
+        encoding: Union[List[List[int]], List[int]] = self.tokenizer(
+            string,
+            add_special_tokens=add_special_tokens,
+            truncation=truncation,
+            return_attention_mask=False,
+        ).input_ids
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
@@ -375,7 +365,7 @@ class VLLM(TemplateLM):
         self,
         requests: List[List[int]] = None,
         generate: bool = False,
-        sampling_params: Union[List[SamplingParams], SamplingParams, None] = None,
+        sampling_params: Union[List["SamplingParams"], "SamplingParams", None] = None,
     ):
         if not generate or sampling_params is None:
             sampling_params = SamplingParams(
@@ -390,9 +380,9 @@ class VLLM(TemplateLM):
             @ray.remote
             def run_inference_one_model(
                 model_args: dict,
-                sampling_params: List[SamplingParams],
+                sampling_params: List["SamplingParams"],
                 requests: List[List[int]],
-                lora_request: LoRARequest,
+                lora_request: "LoRARequest",
             ):
                 llm = LLM(**model_args)
                 return llm.generate(
@@ -430,7 +420,7 @@ class VLLM(TemplateLM):
             procs, resq = [], Queue()
             # We use Process as it is non-daemonic
             try:
-                for rank, (sp, req) in enumerate(zip(requests, sampling_params)):
+                for rank, (req, sp) in enumerate(zip(requests, sampling_params)):
                     proc = Process(
                         target=_vllm_mp_worker,
                         args=(
@@ -806,3 +796,166 @@ class VLLM(TemplateLM):
             "spaces_between_special_tokens", False
         )
         return kwargs
+    
+@register_model("vllm-mera")
+class VLLMMERA(VLLM):
+
+    def tok_encode(
+        self,
+        string: Union[str, List[str]],
+        left_truncate_len: int = None,
+        add_special_tokens: bool = False,
+        truncation: bool = False,
+    ) -> Union[List[int], List[List[int]]]:
+        if not add_special_tokens:
+            add_special_tokens = False or self.add_bos_token
+        if isinstance(string, str) or isinstance(string[0], str):
+            encoding: Union[List[List[int]], List[int]] = self.tokenizer(
+                string,
+                add_special_tokens=add_special_tokens,
+                truncation=truncation,
+                return_attention_mask=False,
+            ).input_ids
+        else:
+            # It must be a formatted chat history dict then
+            encoding: Union[List[List[int]], List[int]] = self.tokenizer.apply_chat_template(
+                string,
+                add_special_tokens=add_special_tokens,
+                truncation=truncation,
+                return_attention_mask=False,
+            )
+
+        # left-truncate the encoded context to be at most `left_truncate_len` tokens long
+        if left_truncate_len:
+            if not isinstance(string, str):
+                encoding = [enc[-left_truncate_len:] for enc in encoding]
+            else:
+                encoding = encoding[-left_truncate_len:]
+
+        return encoding
+
+    def _model_generate(
+        self,
+        requests: List[List[int]] = None,
+        generate: bool = False,
+        sampling_params: Union[List[SamplingParams], SamplingParams, None] = None,
+    ):
+        if not generate or sampling_params is None:
+            sampling_params = SamplingParams(
+                temperature=0, prompt_logprobs=1, max_tokens=1, detokenize=False
+            )
+        if not isinstance(sampling_params, List):
+            sampling_params = [sampling_params] * len(requests)
+        if self.data_parallel_size > 1 and not self.V1:
+            # vLLM hangs if resources are set in ray.remote
+            # also seems to only work with decorator and not with ray.remote() fn
+            # see https://github.com/vllm-project/vllm/issues/973
+            @ray.remote
+            def run_inference_one_model(
+                model_args: dict,
+                sampling_params: List[SamplingParams],
+                requests: List[List[int]],
+                lora_request: LoRARequest,
+            ):
+                llm = LLM(**model_args)
+                return llm.generate(
+                    [TokensPrompt(prompt_token_ids=request) for request in requests],
+                    sampling_params=sampling_params,
+                    lora_request=lora_request,
+                )
+
+            # dispatch requests to all self.data_parallel_size workers, in interleaved fashion
+            # interleaved important to balance context lengths across workers
+            requests = [list(x) for x in distribute(self.data_parallel_size, requests)]
+            sampling_params = [
+                list(sp) for sp in distribute(self.data_parallel_size, sampling_params)
+            ]
+            inputs = (
+                (self.model_args, sp, req, self.lora_request)
+                for req, sp in zip(requests, sampling_params)
+            )
+            object_refs = [run_inference_one_model.remote(*x) for x in inputs]
+            results = ray.get(object_refs)
+            # Invoke ray.shutdown() to prevent hang-ups if subsequent calls required.
+            ray.shutdown()
+            # flatten results
+            return undistribute(results)
+        elif self.data_parallel_size > 1:
+            # based on https://github.com/vllm-project/vllm/blob/a04720bc36401d831cb048c3917b9e58173d9c1d/examples/offline_inference/data_parallel.py
+            dp_size = self.data_parallel_size
+            dp_master_ip = os.environ.get("VLLM_DP_MASTER_IP", "127.0.0.1")
+            dp_master_port = os.environ.get("VLLM_DP_MASTER_PORT") or get_open_port()
+
+            requests = (list(x) for x in distribute(self.data_parallel_size, requests))
+            sampling_params = (
+                list(sp) for sp in distribute(self.data_parallel_size, sampling_params)
+            )
+            procs, resq = [], Queue()
+            # We use Process as it is non-daemonic
+            try:
+                for rank, (sp, req) in enumerate(zip(requests, sampling_params)):
+                    proc = Process(
+                        target=_vllm_mp_worker,
+                        args=(
+                            self.model_args.copy(),
+                            sp,
+                            req,
+                            self.lora_request,
+                            resq,
+                            dp_size,
+                            rank,
+                            dp_master_port,
+                            dp_master_ip,
+                        ),
+                    )
+                    proc.start()
+                    procs.append(proc)
+
+                # Collect results
+                rank_res = {}
+                while len(rank_res) < len(procs):
+                    try:
+                        rank, result = resq.get(timeout=30)
+                        if isinstance(result, dict) and "error" in result:
+                            raise RuntimeError(result["error"])
+                        rank_res[rank] = result
+                    except Empty:
+                        dead_procs = [
+                            idx
+                            for idx, p in enumerate(procs)
+                            if not p.is_alive() and idx not in rank_res
+                        ]
+                        if dead_procs:
+                            raise RuntimeError(
+                                f"Worker processes {dead_procs} died unexpectedly"
+                            )
+                        continue
+
+                results = [rank_res[i] for i in range(len(procs))]
+                return undistribute(results)
+
+            # cleanup
+            finally:
+                try:
+                    resq.close()
+                    resq.join_thread()
+                except Exception:
+                    eval_logger.debug(
+                        "Failed to close vllm DP results queue", exc_info=True
+                    )
+                for proc in procs:
+                    proc.join(timeout=10)
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(timeout=5)
+                        if proc.is_alive():
+                            proc.kill()
+
+        else:
+            outputs = self.model.generate(
+                [TokensPrompt(prompt_token_ids=request) for request in requests],
+                sampling_params=sampling_params,
+                use_tqdm=True if self.batch_size == "auto" else False,
+                lora_request=self.lora_request,
+            )
+            return outputs

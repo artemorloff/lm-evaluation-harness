@@ -5,7 +5,7 @@ from operator import itemgetter
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from lm_eval.api.registry import register_model
-from lm_eval.models.api_models import TemplateAPI
+from lm_eval.models.api_models import TemplateAPI, TemplateAPIMERA
 from lm_eval.models.utils import handle_stop_sequences
 
 
@@ -16,12 +16,46 @@ eval_logger = logging.getLogger(__name__)
 class LocalCompletionsAPI(TemplateAPI):
     def __init__(
         self,
-        base_url: str = None,
-        tokenizer_backend: str = "huggingface",
+        base_url=None,
+        tokenizer_backend="auto",
+        verify_certificate=True,
+        ca_cert_path=None,
+        auth_token=None,
         **kwargs,
     ):
+        # Auto-detect tokenizer backend
+        if tokenizer_backend == "auto":
+            if base_url:
+                from lm_eval.utils import check_remote_tokenizer_support
+
+                if check_remote_tokenizer_support(
+                    base_url,
+                    verify_certificate=verify_certificate,
+                    ca_cert_path=ca_cert_path,
+                    auth_token=auth_token,
+                ):
+                    eval_logger.info(
+                        "Auto-detected remote tokenizer support. Using remote tokenizer backend."
+                    )
+                    tokenizer_backend = "remote"
+                else:
+                    eval_logger.info(
+                        "Remote tokenizer not supported. Using huggingface tokenizer backend."
+                    )
+                    tokenizer_backend = "huggingface"
+            else:
+                eval_logger.warning(
+                    "No base_url provided. Using huggingface tokenizer backend."
+                )
+                tokenizer_backend = "huggingface"
+
         super().__init__(
-            base_url=base_url, tokenizer_backend=tokenizer_backend, **kwargs
+            base_url=base_url,
+            tokenizer_backend=tokenizer_backend,
+            verify_certificate=verify_certificate,
+            ca_cert_path=ca_cert_path,
+            auth_token=auth_token,
+            **kwargs,
         )
 
     def _create_payload(
@@ -106,20 +140,30 @@ class LocalCompletionsAPI(TemplateAPI):
 
 @register_model("local-chat-completions")
 class LocalChatCompletion(LocalCompletionsAPI):
+    """
+    Minimal chat-completions wrapper.
+    - Only accepts messages as list[dict].
+    - No tokenization or template logic.
+    - Use with --apply_chat_template or ensure upstream formats messages correctly.
+    """
+
     def __init__(
         self,
-        base_url: str = None,
-        tokenizer_backend: str = None,
-        tokenized_requests: bool = False,
+        base_url=None,
+        tokenizer_backend=None,
+        tokenized_requests=None,
+        verify_certificate=True,
+        ca_cert_path=None,
+        auth_token=None,
         **kwargs,
     ):
-        eval_logger.warning(
-            "chat-completions endpoint requires the `--apply_chat_template` flag."
-        )
         super().__init__(
             base_url=base_url,
             tokenizer_backend=tokenizer_backend,
             tokenized_requests=tokenized_requests,
+            verify_certificate=verify_certificate,
+            ca_cert_path=ca_cert_path,
+            auth_token=auth_token,
             **kwargs,
         )
         if self._batch_size > 1:
@@ -137,9 +181,13 @@ class LocalChatCompletion(LocalCompletionsAPI):
         eos=None,
         **kwargs,
     ) -> dict:
-        assert type(messages) is not str, (
-            "chat-completions require the --apply_chat_template flag."
+        assert isinstance(messages, list) and all(
+            isinstance(m, dict) for m in messages
+        ), (
+            "LocalChatCompletion expects messages as list[dict]. "
+            "If you see this error, ensure --apply_chat_template is set or upstream code formats messages correctly."
         )
+        gen_kwargs = gen_kwargs or {}
         gen_kwargs.pop("do_sample", False)
         if "max_tokens" in gen_kwargs:
             max_tokens = gen_kwargs.pop("max_tokens")
@@ -225,8 +273,6 @@ class OpenAICompletionsAPI(LocalCompletionsAPI):
 
 @register_model("openai-chat-completions")
 class OpenAIChatCompletion(LocalChatCompletion):
-    MULTIMODAL = True
-
     def __init__(
         self,
         base_url="https://api.openai.com/v1/chat/completions",
@@ -260,6 +306,78 @@ class OpenAIChatCompletion(LocalChatCompletion):
         raise NotImplementedError(
             "Loglikelihood (and therefore `multiple_choice`-type tasks) is not supported for chat completions as OpenAI does not provide prompt logprobs. See https://github.com/EleutherAI/lm-evaluation-harness/issues/942#issuecomment-1777836312 or https://github.com/EleutherAI/lm-evaluation-harness/issues/1196 for more background on this limitation."
         )
+
+    def _create_payload(
+        self,
+        messages: List[Dict],
+        generate=False,
+        gen_kwargs: dict = None,
+        seed=1234,
+        eos="<|endoftext|>",
+        **kwargs,
+    ) -> dict:
+        assert type(messages) is not str, (
+            "chat-completions require the --apply_chat_template flag."
+        )
+        gen_kwargs.pop("do_sample", False)
+        if "max_tokens" in gen_kwargs:
+            max_tokens = gen_kwargs.pop("max_tokens")
+        else:
+            max_tokens = gen_kwargs.pop("max_gen_toks", self._max_gen_toks)
+        temperature = gen_kwargs.pop("temperature", 0)
+        stop = handle_stop_sequences(gen_kwargs.pop("until", ["<|endoftext|>"]), eos)
+        if not isinstance(stop, (list, tuple)):
+            stop = [stop]
+        output = {
+            "messages": messages,
+            "model": self.model,
+            "max_completion_tokens": max_tokens,
+            "temperature": temperature,
+            "stop": stop[:4],
+            "seed": seed,
+            **gen_kwargs,
+        }
+        if (
+            "o1" in self.model
+            or "5" in self.model
+            or "o3" in self.model
+            or "o4" in self.model
+        ):
+            output.pop("stop")
+            output["temperature"] = 1
+        return output
+    
+@register_model("local-completions-mera")
+class LocalCompletionsAPIMERA(LocalCompletionsAPI, TemplateAPIMERA):
+    pass
+
+@register_model("local-chat-completions-mera")
+class LocalChatCompletionMERA(LocalCompletionsAPIMERA):
+    def __init__(
+        self,
+        base_url: str = None,
+        tokenizer_backend: str = None,
+        tokenized_requests: bool = False,
+        **kwargs,
+    ):
+        eval_logger.warning(
+            "chat-completions endpoint requires the `--apply_chat_template` flag."
+        )
+        super().__init__(
+            base_url=base_url,
+            tokenizer_backend=tokenizer_backend,
+            tokenized_requests=tokenized_requests,
+            **kwargs,
+        )
+        if self._batch_size > 1:
+            eval_logger.warning(
+                "Chat completions does not support batching. Defaulting to batch size 1."
+            )
+            self._batch_size = 1
+
+
+@register_model("openai-chat-completions-mera")
+class OpenAIChatCompletionMERA(LocalChatCompletionMERA):
 
     def _create_payload(
         self,
