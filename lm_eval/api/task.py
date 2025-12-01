@@ -1888,7 +1888,6 @@ class ConfigurableTask(Task):
 
         elif self.OUTPUT_TYPE == "generate_until":
             gold = self.doc_to_target(doc)
-            question = self.doc_to_text(doc)
             result = results[0]
             if self.config.doc_to_choice is not None:
                 # If you set doc_to_choice,
@@ -1906,12 +1905,6 @@ class ConfigurableTask(Task):
                 gold = type(result)(gold)
 
             for metric in self._metric_fn_list.keys():
-                args = dict(
-                    **self._metric_fn_kwargs[metric]
-                )
-                if metric == "judge_score":
-                    args["questions"] = question
-
                 if self.multiple_target:
                     # in the case where we have multiple targets,
                     # return true if any are true
@@ -1926,7 +1919,7 @@ class ConfigurableTask(Task):
                         scores = self._metric_fn_list[metric](
                             references=gold,
                             predictions=result,
-                            **args
+                            **self._metric_fn_kwargs[metric],
                         )[metric]
                         result_score = 1.0 if scores > 0.0 else 0.0
                     else:
@@ -1934,8 +1927,8 @@ class ConfigurableTask(Task):
                             try:
                                 result_score = self._metric_fn_list[metric](
                                     references=[gold_option],
-                                    predictions=result,
-                                    **args
+                                    predictions=[result],
+                                    **self._metric_fn_kwargs[metric],
                                 )
                             except (
                                 TypeError
@@ -1956,7 +1949,7 @@ class ConfigurableTask(Task):
                         result_score = self._metric_fn_list[metric](
                             references=[gold],
                             predictions=[result],
-                            **args,
+                            **self._metric_fn_kwargs[metric],
                         )
                     except TypeError:  # needed for now in order to use a different interface between our own metrics and HF Evaluate metrics
                         result_score = self._metric_fn_list[metric]([gold, result])
@@ -2118,3 +2111,4 @@ class PerplexityTask(Task):
     def count_words(cls, doc) -> int:
         """Downstream tasks with custom word boundaries should override this!"""
         return len(re.split(r"\s+", doc))
+    

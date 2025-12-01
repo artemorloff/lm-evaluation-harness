@@ -5,14 +5,13 @@ import random
 import re
 import string
 from collections.abc import Iterable
-from collections import defaultdict
 from typing import Callable, List, Optional, Sequence, TypeVar
 
 import numpy as np
 import sacrebleu
 
 from lm_eval.api.registry import register_aggregation, register_metric
-from transformers.data.metrics import squad_metrics
+
 
 T = TypeVar("T")
 
@@ -140,19 +139,6 @@ def brier_score(items):  # This is a passthrough function
     return np.mean(np.sum((predictions - gold_one_hot) ** 2, axis=1))
 
 
-@register_aggregation("all_in_group")
-def all_in_group(items, group_ids):
-    groups = defaultdict(list)
-    for val, gid in zip(items, group_ids):
-        groups[gid].append(1 if val else 0)
-
-    group_scores = [(1.0 if vals and all(int(v) == 1 for v in vals) else 0.0)
-                    for vals in groups.values()]
-
-    result = (sum(group_scores) / len(group_scores))
-    return result
-
-
 @register_metric(
     metric="brier_score",
     higher_is_better=False,
@@ -218,7 +204,6 @@ def exact_match_hf_evaluate(
     ignore_case=False,
     ignore_punctuation=False,
     ignore_numbers=False,
-    use_transformers_normalization=True,
 ):
     if regexes_to_ignore is not None:
         for s in regexes_to_ignore:
@@ -242,27 +227,9 @@ def exact_match_hf_evaluate(
         predictions = np.char.translate(predictions, table=repl_table)
         references = np.char.translate(references, table=repl_table)
 
-    if use_transformers_normalization:
-        def compute_em(preds, refs):
-            total = 0
-            for pred, ref in zip(preds, refs):
-                total += squad_metrics.compute_exact(pred, ref)
-            return total / len(preds)
+    score_list = predictions == references
 
-        if not isinstance(predictions, list):
-            predictions = predictions.tolist()
-        if not isinstance(references, list):
-            references = references.tolist()
-        predictions_clear = [answer.split("ОТВЕТ")[-1].strip() for answer in predictions]
-
-        em_default = compute_em(references, predictions)
-        em_clear = compute_em(references, predictions_clear)
-        em = max(em_default, em_clear)
-
-        return {"exact_match": em}
-    else:
-        score_list = predictions == references
-        return {"exact_match": np.mean(score_list)}
+    return {"exact_match": np.mean(score_list)}
 
 
 ###
@@ -276,57 +243,6 @@ def exact_match_hf_evaluate(
 )
 def exact_match_fn(**kwargs):
     return exact_match_hf_evaluate(**kwargs)
-
-
-JUDGE_TOKENIZER = None
-
-
-@register_metric(
-    metric="judge_score",
-    higher_is_better=True,
-    output_type="generate_until",
-    aggregation="mean",
-)
-def judge_score_fn(predictions, references, questions):
-    import requests
-    from transformers import AutoTokenizer
-
-    global JUDGE_TOKENIZER
-
-    host = os.getenv("HARNESS_JUDGE_SCORE_HOST", "0.0.0.0")
-    port = os.getenv("HARNESS_JUDGE_SCORE_PORT", "8000")
-    tokenizer_path = os.getenv(
-        "HARNESS_JUDGE_TOKENIZER_PATH",
-        "/home/jovyan/artem/mera_judge/src/first_iteration/rumodernbert",
-    )
-
-    url = f"http://{host}:{port}/classify"
-
-    def classify(text):
-        r = requests.post(url, json={"input": text}).json()
-        return r["data"][0]["probs"]
-
-    def get_query(question, gold, answer, tokenizer):
-        return str(question) + tokenizer.sep_token + str(gold) + tokenizer.sep_token + str(answer)
-
-    def get_ans(probas):
-        if probas[0] < probas[1]:
-            return 1
-        return 0
-
-    def get_answer(question, gold, answer, tokenizer):
-        query = get_query(question, gold, answer, tokenizer)
-        result = classify([query])
-        return get_ans(result)
-
-    if JUDGE_TOKENIZER is None:
-        JUDGE_TOKENIZER = AutoTokenizer.from_pretrained(tokenizer_path)
-
-    total = 0
-    for pred, ref, question in zip(predictions, references, questions):
-        total += get_answer(question, ref, pred, JUDGE_TOKENIZER)
-    result = total / len(predictions)
-    return result
 
 
 @register_metric(
