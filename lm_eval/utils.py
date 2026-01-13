@@ -583,6 +583,10 @@ def convert_bytes_to_hash(value):
     return hashlib.sha256(str(value).encode()).hexdigest()
 
 
+def convert_string_to_hash(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
 def hash_dict_images(data_dict):
     """
     Create a deep copy of `data_dict` where all bytes and PIL.Image.Image values
@@ -595,11 +599,10 @@ def hash_dict_images(data_dict):
         dict: A new dictionary with the same structure as `data_dict`, but with all
               bytes and PIL.Image.Image objects replaced by their hashes.
     """
+    from PIL import Image
 
     def _process_value(value):
         # Bytes -> hash
-        from PIL import Image
-
         if isinstance(value, (bytes, bytearray)):
             return convert_bytes_to_hash(value)
         # PIL Image -> hash
@@ -613,6 +616,12 @@ def hash_dict_images(data_dict):
             return [_process_value(v) for v in value]
         if isinstance(value, tuple):
             return tuple(_process_value(v) for v in value)
+        if isinstance(value, str):
+            multimodal_prefixes = ["data:image/", "data:audio/", "data:video/"]
+            for prefix in multimodal_prefixes:
+                if prefix in value:
+                    return convert_string_to_hash(value)
+
         # Other types remain unchanged
         return value
 

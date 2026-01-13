@@ -1,4 +1,6 @@
+import base64
 import collections
+import copy
 import fnmatch
 import gc
 import itertools
@@ -22,7 +24,9 @@ from typing import (
 
 import torch
 import transformers
+from PIL import Image
 
+from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 eval_logger = logging.getLogger(__name__)
 
@@ -646,6 +650,10 @@ def configure_pad_token(
     Raises:
         AssertionError: If the tokenizer is of type RWKVWorldTokenizer or Rwkv5Tokenizer and the padding token id is not 0.
     """
+    if isinstance(tokenizer, MistralTokenizer):
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        return tokenizer
+
     if tokenizer.pad_token:
         pass
     elif tokenizer.unk_token:
@@ -731,9 +739,41 @@ def handle_stop_sequences(
             f"Expected `kwargs['until']` to be of type Union[str,list] but got {until}"
         )
 
-    if eos is not None and eos not in until:
+    if eos is not None and eos not in until and eos:
         until.append(eos)
     return until
+
+
+def content_image_to_content_image_url(content):
+    from io import BytesIO
+    
+    if isinstance(content, str):
+        return content
+
+    if content["type"] not in ["image", "image_url"]:
+        return content
+
+    new_content = copy.deepcopy(content)
+    image = new_content[content["type"]]
+
+    if not isinstance(image, Image.Image):
+        return content
+
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
+
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    data_uri = f"data:image/png;base64,{b64}"
+
+    new_content["type"] = "image_url"
+    new_content["image_url"] = {
+        "url": data_uri,
+    }
+    if "image" in new_content:
+        del new_content["image"]
+
+    return new_content
 
 
 def resize_image(
