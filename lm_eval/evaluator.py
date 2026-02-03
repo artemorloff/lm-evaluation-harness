@@ -379,6 +379,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        predict_only=predict_only,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -442,6 +443,7 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
+    predict_only: bool = False,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -476,6 +478,8 @@ def evaluate(
         verbosity (str): Verbosity level for logging. (no-op, deprecated)
         confirm_run_unsafe_code (bool): Whether to confirm running tasks marked
             as unsafe.
+        param predict_only (bool): If true only model outputs will be generated
+            and returned. Metrics will not be evaluated
 
     Returns:
         dict | None: Dictionary of results, or None if not on rank 0.
@@ -649,7 +653,7 @@ def evaluate(
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
     for task_output, limit in zip(eval_tasks, limits, strict=True):
         task = task_output.task
-        task.apply_filters()
+        task.apply_filters(predict_only=predict_only)
 
         ### Collect values of metrics on all datapoints ###
         # # unpack results and sort back in order and return control to Task

@@ -1,8 +1,12 @@
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from lm_eval.api.instance import Instance
+
+
+eval_logger = logging.getLogger(__name__)
 
 
 class Filter(ABC):
@@ -14,6 +18,7 @@ class Filter(ABC):
 
     """
 
+    @abstractmethod
     def __init__(self, **kwargs) -> None:
         """
         Can define custom behavior here, if an individual instantiation of a Filter class should have state.
@@ -42,15 +47,25 @@ class FilterEnsemble:
     name: str
     filters: list[Callable[[], Filter]]
 
-    def apply(self, instances: list[Instance]) -> None:
-        resps, docs = zip(*((inst.resps, inst.doc) for inst in instances))
+    def apply(self, instances: list[Instance], predict_only=False) -> None:
+        resps, docs = zip(*((inst.resps, inst.doc) for inst in instances), strict=False)
         resps, docs = list(resps), list(docs)
 
         for f in self.filters:
             # apply filters in sequence
-            resps = f().apply(resps, docs)
+            function = f()
+            if hasattr(function, "DISABLE_ON_PREDICT_ONLY"):
+                try:
+                    resps = function.apply(resps, docs, predict_only)
+                except Exception:
+                    eval_logger.warning(
+                        "Using filter with `DISABLE_ON_PREDICT_ONLY=True`, but it does not take `predict_only` as input. Passing it without `predict_only` parameter."
+                    )
+                    resps = function.apply(resps, docs)
+            else:
+                resps = function.apply(resps, docs)
 
         # add the end results after filtering to filtered_requests of their respective source instances.
         # has key `self.name`: each FilterEnsemble applied in a given run should use a different name.
-        for inst, resp in zip(instances, resps):
+        for inst, resp in zip(instances, resps, strict=False):
             inst.filtered_resps[self.name] = resp
