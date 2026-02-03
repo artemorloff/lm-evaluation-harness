@@ -8,6 +8,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING
 
 import numpy as np
+from tqdm import tqdm
 
 import lm_eval.api.metrics
 import lm_eval.api.model
@@ -370,6 +371,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        predict_only=predict_only,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -433,6 +435,7 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
+    predict_only: bool = False,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -467,9 +470,17 @@ def evaluate(
         Verbosity level for logging
     :param confirm_run_unsafe_code: bool
         Whether to confirm running tasks marked as unsafe.
+    :param predict_only: bool
+        If true only model outputs will be generated and returned. Metrics will not be evaluated
     :return
         Dictionary of results
     """
+
+    # names of requests meta-types
+    CONTEXT_BASED_TYPE_ID = "context-based"
+    DEFAULT_TYPE_ID = "regular"
+    # name of the attribute inside task that allows using ctx
+    CONTEXT_BASED_TYPE_ATTR = "CONTEXT_BASED"
 
     if limit is not None and samples is not None:
         raise ValueError(
@@ -481,11 +492,18 @@ def evaluate(
         eval_logger.warning(
             "Chat template formatting change affects loglikelihood and multiple-choice tasks. See docs/chat-template-readme.md for details."
         )
+    ### prepare to split all requests into two meta-groups
     # tracks all Instances/requests a model must generate output on.
-    requests = defaultdict(list)
+    requests = {
+        CONTEXT_BASED_TYPE_ID: defaultdict(list),
+        DEFAULT_TYPE_ID: defaultdict(list),
+    }
     # stores the amount to pad out reqs per req. type so that
     # number of fwd passes per distributed rank is equal
-    padding_requests = defaultdict(int)
+    padding_requests = {
+        CONTEXT_BASED_TYPE_ID: defaultdict(int),
+        DEFAULT_TYPE_ID: defaultdict(int),
+    }
 
     # get lists of group hierarchy and each type of request
     eval_tasks = get_task_list(task_dict)
@@ -547,9 +565,15 @@ def evaluate(
         if write_out:
             print_writeout(task)
         # aggregate Instances by LM method requested to get output.
+        task_type_id = (
+            CONTEXT_BASED_TYPE_ID
+            if getattr(task, CONTEXT_BASED_TYPE_ATTR, False)
+            else DEFAULT_TYPE_ID
+        )
         for instance in task.instances:
             reqtype = instance.request_type
-            requests[reqtype].append(instance)
+            # split requests into two groups: with and without context
+            requests[task_type_id][reqtype].append(instance)
 
         if lm.world_size > 1:
             import torch
@@ -567,30 +591,51 @@ def evaluate(
             # compute number of pseudo-batches to pad with (FSDP/DDP require even batches among ranks)
             numpad = max(gathered_item) - gathered_item[lm.rank]
             # todo: may not account for padding in cases like SquadV2 which has multiple req types
-            padding_requests[reqtype] += numpad
+            # pad each group separately
+            padding_requests[task_type_id][reqtype] += numpad
 
     ### Run LM on inputs, get all outputs ###
-    # execute each type of request
-    for reqtype, reqs in requests.items():
-        eval_logger.info(f"Running {reqtype} requests")
-        # create `K` copies of each request `req` based off `K = req.repeats`
-        cloned_reqs = []
-        for req in reqs:
-            cloned_reqs.extend([req] * req.repeats)
-
-        if (lm.world_size > 1) and (padding_requests[reqtype] > 0):
-            for _ in range(padding_requests[reqtype]):
+    # execute each group of request: ctx-based and regular
+    for task_type, type_requests in requests.items():
+        # execute each type of request
+        for reqtype, reqs in type_requests.items():
+            eval_logger.info(f"Running {task_type} {reqtype} requests")
+            # create `K` copies of each request `req` based off `K = req.repeats`
+            cloned_reqs = []
+            for req in reqs:
                 cloned_reqs.extend([req] * req.repeats)
 
-        # run requests through model
-        resps = getattr(lm, reqtype)(cloned_reqs)
+            if (lm.world_size > 1) and (padding_requests[task_type][reqtype] > 0):
+                for _ in range(padding_requests[task_type][reqtype]):
+                    cloned_reqs.extend([req] * req.repeats)
 
-        # put responses from model into a list of length K for each request.
-        for x, req in zip(resps, cloned_reqs, strict=True):
-            req.resps.append(x)
+            # regular requests are left untouched
+            if task_type == DEFAULT_TYPE_ID:
+                # run all requests through model
+                resps = getattr(lm, reqtype)(cloned_reqs)
 
-        if lm.world_size > 1:
-            lm.accelerator.wait_for_everyone()
+                # put responses from model into a list of length K for each request.
+                for x, req in zip(resps, cloned_reqs, strict=False):
+                    req.resps.append(x)
+            # context tasks require separate reqs processing
+            else:
+                # needed to store lm outputs
+                storage = {}
+                # iterate over all requests
+                # this tqdm does not overwrite internal tqdms of getattr(lm, reqtype)
+                for req in tqdm(cloned_reqs, desc=f"Running {reqtype} requests"):
+                    # one request per iteration, each time update req.args
+                    req = req.update_request(storage, req)
+                    # only one resp for a single request
+                    resp = getattr(lm, reqtype)([req])
+                    # simultaneously add output to the Instance attr
+                    req.resps.extend(resp)
+                    # push changes into storage
+                    # also discard storage after the current set ends
+                    storage = req.update_storage(storage, req)
+
+            if lm.world_size > 1:
+                lm.accelerator.wait_for_everyone()
 
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
@@ -598,7 +643,7 @@ def evaluate(
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
     for task_output, limit in zip(eval_tasks, limits, strict=True):
         task = task_output.task
-        task.apply_filters()
+        task.apply_filters(predict_only=predict_only)
 
         ### Collect values of metrics on all datapoints ###
         # # unpack results and sort back in order and return control to Task
