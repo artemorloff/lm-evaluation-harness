@@ -745,9 +745,6 @@ class ConfigurableTask(Task):
         # Get pre-configured attributes
         self._config = self.CONFIG
 
-        # read context-based flag
-        self.CONTEXT_BASED = getattr(self.config, "context_based", False)
-
         # Use new configurations if there was no preconfiguration
         if self.config is None:
             self._config = TaskConfig(**config)
@@ -760,6 +757,9 @@ class ConfigurableTask(Task):
             raise ValueError(
                 "Must pass a config to ConfigurableTask, either in cls.CONFIG or `config` kwarg"
             )
+
+        # read context-based flag
+        self.CONTEXT_BASED = getattr(self._config, "context_based", False)
 
         if isinstance(self.config.metadata, dict):
             if "version" in self.config.metadata:

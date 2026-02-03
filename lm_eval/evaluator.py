@@ -623,7 +623,9 @@ def evaluate(
                 storage = {}
                 # iterate over all requests
                 # this tqdm does not overwrite internal tqdms of getattr(lm, reqtype)
-                for req in tqdm(cloned_reqs, desc=f"Running {reqtype} requests"):
+                for req in tqdm(
+                    cloned_reqs, desc=f"Running {task_type} {reqtype} requests"
+                ):
                     # one request per iteration, each time update req.args
                     req = req.update_request(storage, req)
                     # only one resp for a single request
