@@ -351,9 +351,10 @@ class VLLM(TemplateLM):
         add_special_tokens=None,
         **kwargs,
     ) -> Union[List[int], List[List[int]]]:
-	if not string:
+        if not string:
             return []
-	_string = [string] if isinstance(string, str) else string
+        truncation = kwargs.pop("truncation", False)
+        _string = [string] if isinstance(string, str) else string
         _bos_token = self.tokenizer.decode(self.prefix_token_id)
         if not add_special_tokens:
             add_special_tokens = False or self.add_bos_token

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 from tqdm import tqdm
 
 import numpy as np
+from tqdm import tqdm
 
 import lm_eval.api.metrics
 import lm_eval.api.model
@@ -384,6 +385,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        predict_only=predict_only,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -449,6 +451,7 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
+    predict_only: bool = False,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -486,9 +489,17 @@ def evaluate(
         Verbosity level for logging
     :param confirm_run_unsafe_code: bool
         Whether to confirm running tasks marked as unsafe.
+    :param predict_only: bool
+        If true only model outputs will be generated and returned. Metrics will not be evaluated
     :return
         Dictionary of results
     """
+
+    # names of requests meta-types
+    CONTEXT_BASED_TYPE_ID = "context-based"
+    DEFAULT_TYPE_ID = "regular"
+    # name of the attribute inside task that allows using ctx
+    CONTEXT_BASED_TYPE_ATTR = "CONTEXT_BASED"
 
     if limit is not None and samples is not None:
         raise ValueError(
@@ -593,7 +604,7 @@ def evaluate(
             reqtype = instance.request_type
             # split requests into two groups: with and without context
             requests[task_type_id][reqtype].append(instance)
-        if not USE_TP and lm.world_size > 1:
+        if lm.world_size > 1:
             import torch
 
             instances_rnk = torch.tensor(len(task._instances), device=lm.device)
@@ -612,28 +623,27 @@ def evaluate(
             # pad each group separately
             padding_requests[task_type_id][reqtype] += numpad
     ### Run LM on inputs, get all outputs ###
-
     # execute each group of request: ctx-based and regular
     for task_type, type_requests in requests.items():
-        # for reqtype in a group
         for reqtype, reqs in type_requests.items():
-            eval_logger.info(f"Running {reqtype} requests")
+        # execute each type of request
+            eval_logger.info(f"Running {task_type} {reqtype} requests")
             # create `K` copies of each request `req` based off `K = req.repeats`
             cloned_reqs = []
             for req in reqs:
                 cloned_reqs.extend([req] * req.repeats)
 
-            if not USE_TP and (lm.world_size > 1) and (padding_requests[reqtype] > 0):
-                for _ in range(padding_requests[reqtype]):
+            if (lm.world_size > 1) and (padding_requests[task_type][reqtype] > 0):
+                for _ in range(padding_requests[task_type][reqtype]):
                     cloned_reqs.extend([req] * req.repeats)
 
             # regular requests are left untouched
             if task_type == DEFAULT_TYPE_ID:
                 # run all requests through model
                 resps = getattr(lm, reqtype)(cloned_reqs)
-	        # put responses from model into a list of length K for each request.
-       		 for x, req in zip(resps, cloned_reqs, strict=True):
-           	 	req.resps.append(x)
+    	        # put responses from model into a list of length K for each request.
+                for x, req in zip(resps, cloned_reqs, strict=True):
+                    req.resps.append(x)
 
             # context tasks require separate reqs processing
             else:
@@ -670,7 +680,7 @@ def evaluate(
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
     for task_output, limit in zip(eval_tasks, limits, strict=True):
         task = task_output.task
-        task.apply_filters()
+        task.apply_filters(predict_only=predict_only)
 
         ### Collect values of metrics on all datapoints ###
         # # unpack results and sort back in order and return control to Task

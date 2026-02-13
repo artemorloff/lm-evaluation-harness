@@ -4,21 +4,17 @@ import logging
 import random
 import re
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from inspect import getsource
 from typing import (
     Any,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
     Literal,
-    Mapping,
-    Optional,
-    Tuple,
     Union,
+    Dict,
+    Optional,
+    List
 )
 
 import datasets
@@ -64,55 +60,54 @@ eval_logger = logging.getLogger(__name__)
 @dataclass
 class TaskConfig(dict):
     # task naming/registry
-    task: Optional[str] = None
-    task_alias: Optional[str] = None
-    tag: Optional[Union[str, list]] = None
+    task: str | None = None
+    task_alias: str | None = None
+    tag: str | list | None = None
     # HF dataset options.
     # which dataset to use,
     # and what splits for what purpose
-    custom_dataset: Optional[Callable] = None
-    dataset_path: Optional[str] = None
-    dataset_name: Optional[str] = None
-    dataset_kwargs: Optional[dict] = None
+    custom_dataset: Callable | None = None
+    dataset_path: str | None = None
+    dataset_name: str | None = None
+    dataset_kwargs: dict | None = None
     # context-based flag and funcs
-    context_based: Optional[bool] = None
-    request_updater: Optional[Callable] = None
-    storage_updater: Optional[Callable] = None
-    training_split: Optional[str] = None
-    validation_split: Optional[str] = None
-    test_split: Optional[str] = None
-    fewshot_split: Optional[str] = (
+    context_based: bool | None = None
+    request_updater: Callable | None = None
+    storage_updater: Callable | None = None
+    training_split: str | None = None
+    validation_split: str | None = None
+    test_split: str | None = None
+    fewshot_split: str | None = (
         None  # TODO: assert that this not None if num_fewshot > 0. (?) assert if this is same split as one evaluating (?)
     )
     # formatting / prompting options.
     # see docs/advanced_task_guide.md for more info
-    process_docs: Optional[Callable] = None
-    doc_to_text: Optional[Union[Callable, str]] = None
-    doc_to_target: Optional[Union[Callable, str]] = None
-    doc_to_image: Union[Callable, str] = None
-    doc_to_video: Union[Callable, str] = None
-    doc_to_audio: Union[Callable, str] = None
-    doc_to_video: Union[Callable, str] = None
+    process_docs: Callable | None = None
+    doc_to_text: Callable | str | None = None
+    doc_to_target: Callable | str | None = None
+    doc_to_image: Callable | str = None
+    doc_to_video: Callable | str = None
+    doc_to_audio: Callable | str = None
     unsafe_code: bool = False
-    doc_to_choice: Optional[Union[Callable, str, dict, list]] = None
-    process_results: Optional[Union[Callable, str]] = None
-    use_prompt: Optional[str] = None
+    doc_to_choice: Callable | str | dict | list | None = None
+    process_results: Callable | str | None = None
+    use_prompt: str | None = None
     description: str = ""
     target_delimiter: str = " "
     fewshot_delimiter: str = "\n\n"
-    fewshot_config: Optional[dict] = None
+    fewshot_config: dict | None = None
     # runtime configuration options
-    num_fewshot: Optional[int] = None
+    num_fewshot: int | None = None
     # scoring options
-    metric_list: Optional[list] = None
+    metric_list: list | None = None
     output_type: OutputType = "generate_until"
-    generation_kwargs: Optional[dict] = None
+    generation_kwargs: dict | None = None
     repeats: int = 1
-    filter_list: Optional[Union[str, list]] = None
+    filter_list: str | list | None = None
     should_decontaminate: bool = False
-    doc_to_decontamination_query: Optional[str] = None
-    gen_prefix: Optional[str] = None
-    metadata: Optional[dict] = (
+    doc_to_decontamination_query: str | None = None
+    gen_prefix: str | None = None
+    metadata: dict | None = (
         None  # by default, not used in the code. allows for users to pass arbitrary info to tasks
     )
 
@@ -183,8 +178,8 @@ class TaskConfig(dict):
         return cfg_dict
 
     def serialize_function(
-        self, value: Union[Callable, str], keep_callable=False
-    ) -> Union[Callable, str]:
+        self, value: Callable | str, keep_callable=False
+    ) -> Callable | str:
         """Serializes a given function or string.
 
         If 'keep_callable' is True, the original callable is returned.
@@ -294,7 +289,11 @@ def replace_video_with_images(messages, num_images):
                             }
                         }
                     else:
-                        img = to_pil_image(image["data"])
+                        if isinstance(image, dict):
+                            frame = image.get("data", image)
+                        else:
+                            frame = image
+                        img = to_pil_image(frame)
                         ith_image = {
                             "type": "image",
                             "image": img
@@ -316,26 +315,26 @@ class Task(abc.ABC):
         {"question": ..., question, answer)
     """
 
-    VERSION: Optional[Union[int, str]] = None
+    VERSION: int | str | None = None
 
     # The name of the `Task` benchmark as denoted in the HuggingFace datasets Hub
     # or a path to a custom `datasets` loading script.
-    DATASET_PATH: Optional[str] = None
+    DATASET_PATH: str | None = None
 
     # The name of a subset within `DATASET_PATH`.
-    DATASET_NAME: Optional[str] = None
+    DATASET_NAME: str | None = None
 
-    OUTPUT_TYPE: Optional[OutputType] = None
+    OUTPUT_TYPE: OutputType | None = None
 
     # defines meta-group of the task
     CONTEXT_BASED: Optional[bool] = None
 
     def __init__(
         self,
-        data_dir: Optional[str] = None,
-        cache_dir: Optional[str] = None,
-        download_mode: Optional[datasets.DownloadMode] = None,
-        config: Optional[Mapping] = None,  # Union[dict, TaskConfig]
+        data_dir: str | None = None,
+        cache_dir: str | None = None,
+        download_mode: datasets.DownloadMode | None = None,
+        config: Mapping | None = None,  # Union[dict, TaskConfig]
     ) -> None:
         """
         :param data_dir: str
@@ -359,21 +358,21 @@ class Task(abc.ABC):
                 Fresh download and fresh dataset.
         """
         self.download(data_dir, cache_dir, download_mode)
-        self._training_docs: Optional[list] = None
-        self._fewshot_docs: Optional[list] = None
-        self._instances: Optional[List[Instance]] = None
+        self._training_docs: list | None = None
+        self._fewshot_docs: list | None = None
+        self._instances: list[Instance] | None = None
 
         self._config: TaskConfig = TaskConfig({**config}) if config else TaskConfig()
 
         self._filters = [build_filter_ensemble("none", [["take_first", None]])]
-        self.fewshot_rnd: Optional[random.Random] = (
+        self.fewshot_rnd: random.Random | None = (
             None  # purposely induce errors in case of improper usage
         )
 
     def download(
         self,
-        data_dir: Optional[str] = None,
-        cache_dir: Optional[str] = None,
+        data_dir: str | None = None,
+        cache_dir: str | None = None,
         download_mode=None,
     ) -> None:
         """Downloads and returns the task dataset.
@@ -478,7 +477,7 @@ class Task(abc.ABC):
         return doc
 
     @property
-    def instances(self) -> List[Instance]:
+    def instances(self) -> list[Instance]:
         """After calling `task.build_all_requests()`, tasks
         maintain a list of the dataset instances which will be evaluated.
         """
@@ -519,18 +518,18 @@ class Task(abc.ABC):
     def build_all_requests(
         self,
         *,
-        limit: Union[int, None] = None,
-        samples: Optional[List[int]] = None,
+        limit: int | None = None,
+        samples: list[int] | None = None,
         rank: int = 0,
         world_size: int = 1,
         cache_requests: bool = False,
         rewrite_requests_cache: bool = False,
-        system_instruction: Optional[str] = None,
+        system_instruction: str | None = None,
         apply_chat_template: bool = False,
         pass_multimodal_args_to_chat_history: bool = False,
         replace_videos_with_images_amount: int = 0,
         fewshot_as_multiturn: bool = False,
-        chat_template: Optional[Callable] = None,
+        chat_template: Callable | None = None,
         tokenizer_name: str = "",
     ) -> None:
         """Build a set of Instances for a task, and store them in task.instances"""
@@ -761,11 +760,11 @@ class Task(abc.ABC):
         example = self.doc_to_text(doc)
         return description + labeled_examples + example
 
-    def apply_filters(self) -> Optional[List[Instance]]:
+    def apply_filters(self, predict_only) -> list[Instance] | None:
         """Iterates over FilterEnsembles and applies them to instances"""
         if hasattr(self, "_filters"):
             for f in self._filters:
-                f.apply(self._instances)
+                f.apply(self._instances, predict_only=predict_only)
         else:
             eval_logger.warning("No filter defined, passing through instances")
             return self._instances
@@ -816,13 +815,13 @@ class Task(abc.ABC):
         setattr(self._config, "metric_list", [{"metric": metric_name}])
         setattr(self._config, "process_results", None)
 
-    def set_fewshot_seed(self, seed: Optional[int] = None) -> None:
+    def set_fewshot_seed(self, seed: int | None = None) -> None:
         self.fewshot_rnd = random.Random(seed)
         if hasattr(self, "sampler"):
             self.sampler.rnd = self.fewshot_rnd
 
     @property
-    def eval_docs(self) -> Union[datasets.Dataset, List[dict]]:
+    def eval_docs(self) -> datasets.Dataset | list[dict]:
         if self.has_test_docs():
             return self.test_docs()
         elif self.has_validation_docs():
@@ -836,10 +835,10 @@ class Task(abc.ABC):
         self,
         *,
         rank: int = 0,
-        limit: Union[int, None] = None,
+        limit: int | None = None,
         world_size: int = 1,
-        samples: Optional[List[int]] = None,
-    ) -> Iterator[Tuple[int, Any]]:
+        samples: list[int] | None = None,
+    ) -> Iterator[tuple[int, Any]]:
         if samples:
             n = len(self.eval_docs)
             assert all([e < n for e in samples]), (
@@ -871,6 +870,7 @@ class Task(abc.ABC):
         return self.config.storage_updater(request, storage)
 
 
+
 class ConfigurableTask(Task):
     VERSION = "Yaml"
     OUTPUT_TYPE = None
@@ -881,7 +881,7 @@ class ConfigurableTask(Task):
         data_dir=None,
         cache_dir=None,
         download_mode=None,
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ) -> None:  # TODO no super() call here
         # Get pre-configured attributes
         self._config = self.CONFIG
@@ -898,6 +898,9 @@ class ConfigurableTask(Task):
             raise ValueError(
                 "Must pass a config to ConfigurableTask, either in cls.CONFIG or `config` kwarg"
             )
+
+        # read context-based flag
+        self.CONTEXT_BASED = getattr(self._config, "context_based", False)
 
         if isinstance(self.config.metadata, dict):
             if "version" in self.config.metadata:
@@ -1049,7 +1052,7 @@ class ConfigurableTask(Task):
             self.fewshot_rnd = (
                 random.Random()
             )  # setting with no seed, to be overridden at a later time
-            config_sampler: Union[str, Callable] = (
+            config_sampler: str | Callable = (
                 self.config.fewshot_config.get("sampler", "default")
                 if self.config.fewshot_config
                 else "default"
@@ -1129,9 +1132,7 @@ class ConfigurableTask(Task):
                         f'Both target_delimiter "{self.config.target_delimiter}" and target choice: "{choice}" do not have whitespace, ignore if the language you are evaluating on does not require/use whitespace'
                     )
 
-    def download(
-        self, dataset_kwargs: Optional[Dict[str, Any]] = None, **kwargs
-    ) -> None:
+    def download(self, dataset_kwargs: dict[str, Any] | None = None, **kwargs) -> None:
         from packaging.version import parse as vparse
 
         if dataset_kwargs and vparse(datasets.__version__) >= vparse("4.0.0"):
@@ -1219,7 +1220,7 @@ class ConfigurableTask(Task):
 
     @staticmethod
     def append_target_question(
-        labeled_examples: List[Dict[str, str]],
+        labeled_examples: list[dict[str, str]],
         question: str,
         fewshot_as_multiturn: bool = False,
         pass_multimodal_args_to_chat_history: bool = False,
@@ -1264,13 +1265,13 @@ class ConfigurableTask(Task):
         self,
         doc: dict,
         num_fewshot: int,
-        system_instruction: Optional[str] = None,
+        system_instruction: str | None = None,
         apply_chat_template: bool = False,
         pass_multimodal_args_to_chat_history: bool = False,
         fewshot_as_multiturn: bool = False,
-        chat_template: Optional[Callable] = None,
-        gen_prefix: Optional[str] = None,
-    ) -> Union[str, List[str]]:
+        chat_template: Callable | None = None,
+        gen_prefix: str | None = None,
+    ) -> str | list[str]:
         """Returns a fewshot context string that is made up of a prepended description
         (if provided), the `num_fewshot` number of examples, and an appended prompt example.
 
@@ -1448,11 +1449,11 @@ class ConfigurableTask(Task):
                 else:
                     return labeled_examples + str(example) + prefix, multimodal_args
 
-    def apply_filters(self) -> Optional[List[Instance]]:
+    def apply_filters(self, predict_only) -> list[Instance] | None:
         """Iterates over FilterEnsembles and applies them to instances"""
         if hasattr(self, "_filters"):
             for f in self._filters:
-                f.apply(self._instances)
+                f.apply(self._instances, predict_only=predict_only)
         else:
             eval_logger.warning("No filter defined, passing through instances")
             return self._instances
@@ -1524,7 +1525,7 @@ class ConfigurableTask(Task):
             print(type(doc_to_text))
             raise TypeError
 
-    def doc_to_target(self, doc: Mapping, doc_to_target=None) -> Union[int, str, list]:
+    def doc_to_target(self, doc: Mapping, doc_to_target=None) -> int | str | list:
         if self.prompt is not None:
             doc_to_target = self.prompt
         elif doc_to_target is not None:
@@ -1570,7 +1571,7 @@ class ConfigurableTask(Task):
         else:
             raise TypeError
 
-    def doc_to_choice(self, doc: Any, doc_to_choice=None) -> List[str]:
+    def doc_to_choice(self, doc: Any, doc_to_choice=None) -> list[str]:
         if self.prompt is not None:
             doc_to_choice = self.prompt
         elif doc_to_choice is not None:
@@ -1596,7 +1597,7 @@ class ConfigurableTask(Task):
         else:
             raise TypeError
 
-    def doc_to_image(self, doc: Any, doc_to_image=None) -> Union[int, str, list]:
+    def doc_to_image(self, doc: Any, doc_to_image=None) -> int | str | list:
         if doc_to_image is not None:
             doc_to_image = doc_to_image
         elif self.config.doc_to_image is not None:
@@ -1689,7 +1690,6 @@ class ConfigurableTask(Task):
                     "storage_updater": self._update_storage,
                 },
             )
-
         apply_chat_template = kwargs.pop("apply_chat_template", False)
         chat_template: Callable | None = kwargs.pop("chat_template", None)
 
@@ -2002,20 +2002,20 @@ class MultipleChoiceTask(Task):
     def doc_to_target(self, doc: dict) -> str:
         return " " + doc["choices"][doc["gold"]]
 
-    def construct_requests(self, doc: dict, ctx: str, **kwargs) -> List[Instance]:
+    def construct_requests(self, doc: dict, ctx: str, **kwargs) -> list[Instance]:
         # TODO: add mutual info here?
         return [
             Instance(
                 request_type="loglikelihood",
                 doc=doc,
-                arguments=(ctx, " {}".format(choice)),
+                arguments=(ctx, f" {choice}"),
                 idx=i,
                 **kwargs,
             )
             for i, choice in enumerate(doc["choices"])
         ]
 
-    def process_results(self, doc: dict, results: Iterable[Tuple[float, bool]]) -> dict:
+    def process_results(self, doc: dict, results: Iterable[tuple[float, bool]]) -> dict:
         results = [
             res[0] for res in results
         ]  # only retain loglikelihoods, discard is_greedy TODO: do we need is_greedy anywhere?
@@ -2049,7 +2049,7 @@ class PerplexityTask(Task):
     def has_training_docs(self) -> bool:
         return False
 
-    def fewshot_examples(self, k: int, rnd) -> List:
+    def fewshot_examples(self, k: int, rnd) -> list:
         if k != 0:
             raise ValueError(
                 "The number of fewshot examples must be 0 for perplexity tasks."
@@ -2080,7 +2080,7 @@ class PerplexityTask(Task):
     def doc_to_target(self, doc):
         return doc
 
-    def construct_requests(self, doc: dict, ctx: Optional[str], **kwargs):
+    def construct_requests(self, doc: dict, ctx: str | None, **kwargs):
         if bool(ctx):
             raise ValueError
 
@@ -2092,7 +2092,7 @@ class PerplexityTask(Task):
             **kwargs,
         )
 
-    def process_results(self, doc: dict, results: Tuple[float]) -> dict:
+    def process_results(self, doc: dict, results: tuple[float]) -> dict:
         (loglikelihood,) = results
         words = self.count_words(self.doc_to_target(doc))
         bytes_ = self.count_bytes(self.doc_to_target(doc))

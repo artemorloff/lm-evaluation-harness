@@ -1,5 +1,6 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 
 OutputType = Literal[
@@ -13,16 +14,16 @@ class Instance:
     doc: dict
     arguments: tuple
     idx: int
-    metadata: Tuple[Optional[str], Optional[int], Optional[int]] = field(
+    metadata: tuple[str | None, int | None, int | None] = field(
         default_factory=lambda: (None, None, None)
     )
     resps: list = field(default_factory=list)
     filtered_resps: dict = field(default_factory=dict)
 
     # initialized after init
-    task_name: Optional[str] = None
-    doc_id: Optional[int] = None
-    repeats: Optional[int] = None
+    task_name: str | None = None
+    doc_id: int | None = None
+    repeats: int | None = None
 
     def __post_init__(self) -> None:
         # unpack metadata field
@@ -43,8 +44,8 @@ class Instance:
 class ContextInstance(Instance):
     def __init__(
         self,
-        requests_updater: Optional[Callable] = None,
-        storage_updater: Optional[Callable] = None,
+        requests_updater: Callable | None = None,
+        storage_updater: Callable | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -54,13 +55,13 @@ class ContextInstance(Instance):
     # used for updating requests from storage info
     @property
     def update_request(self):
-        if getattr(self, "_update_request") is not None:
+        if getattr(self, "_update_request", None) is not None:
             return self._update_request
         raise NotImplementedError("Method for updating request is not defined.")
 
     # used for updating storage from request and LM answer info
     @property
     def update_storage(self):
-        if getattr(self, "_update_storage") is not None:
+        if getattr(self, "_update_storage", None) is not None:
             return self._update_storage
         raise NotImplementedError("Method for updating storage is not defined.")

@@ -73,6 +73,8 @@ MODEL_MAPPING = {
     "vllm": "lm_eval.models.vllm_causallms:VLLM",
     "vllm-vlm": "lm_eval.models.vllm_vlms:VLLM_VLM",
     "watsonx_llm": "lm_eval.models.ibm_watsonx_ai:IBMWatsonxAI",
+    "gigachat-completion": "lm_eval.models.gigachat:GigaChatLM",
+    "gigachat-chat": "lm_eval.models.gigachat:GigaChatAPI",
 }
 
 
