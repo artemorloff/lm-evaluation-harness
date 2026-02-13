@@ -10,12 +10,11 @@ from typing import TYPE_CHECKING, List, Optional, Union
 from tqdm import tqdm
 
 import numpy as np
-import torch
 
 import lm_eval.api.metrics
+import lm_eval.api.model
 import lm_eval.api.registry
 import lm_eval.api.task
-import lm_eval.models
 from lm_eval.caching.cache import delete_cache
 from lm_eval.evaluator_utils import (
     consolidate_group_results,
@@ -35,6 +34,7 @@ from lm_eval.utils import (
     hash_dict_images,
     hash_string,
     positional_deprecated,
+    set_torch_seed,
     setup_logging,
     simple_parse_args_string,
     wrap_text,
@@ -51,18 +51,18 @@ eval_logger = logging.getLogger(__name__)
 @positional_deprecated
 def simple_evaluate(
     model,
-    model_args: Optional[Union[str, dict]] = None,
-    tasks: Optional[List[Union[str, dict, object]]] = None,
-    num_fewshot: Optional[int] = None,
-    batch_size: Optional[Union[int, str]] = None,
-    max_batch_size: Optional[int] = None,
-    device: Optional[str] = None,
-    use_cache: Optional[str] = None,
+    model_args: str | dict | None = None,
+    tasks: list[str | dict | object] | None = None,
+    num_fewshot: int | None = None,
+    batch_size: int | str | None = None,
+    max_batch_size: int | None = None,
+    device: str | None = None,
+    use_cache: str | None = None,
     cache_requests: bool = False,
     rewrite_requests_cache: bool = False,
     delete_requests_cache: bool = False,
-    limit: Optional[Union[int, float]] = None,
-    samples: Optional[dict] = None,
+    limit: int | float | None = None,
+    samples: dict | None = None,
     bootstrap_iters: int = 100000,
     check_integrity: bool = False,
     write_out: bool = False,
@@ -73,8 +73,8 @@ def simple_evaluate(
     pass_multimodal_args_to_chat_history: bool = False,
     replace_videos_with_images_amount: int = 0,
     fewshot_as_multiturn: bool = False,
-    gen_kwargs: Union[str, dict, None] = None,
-    task_manager: Optional[TaskManager] = None,
+    gen_kwargs: str | dict | None = None,
+    task_manager: TaskManager | None = None,
     verbosity=None,
     predict_only: bool = False,
     random_seed: int = 0,
@@ -82,7 +82,7 @@ def simple_evaluate(
     torch_random_seed: int = 1234,
     fewshot_random_seed: int = 1234,
     confirm_run_unsafe_code: bool = False,
-    metadata: Optional[dict] = None,
+    metadata: dict | None = None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -150,7 +150,8 @@ def simple_evaluate(
         Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
     :param metadata: dict
         Additional metadata to be added to the task manager. Will get passed to the download function of the task.
-    return
+
+    Return:
         Dictionary of results
     """
     if verbosity is not None:
@@ -205,7 +206,7 @@ def simple_evaluate(
 
     if torch_random_seed is not None:
         seed_message.append(f"Setting torch manual seed to {torch_random_seed}")
-        torch.manual_seed(torch_random_seed)
+        set_torch_seed(torch_random_seed)
 
     if fewshot_random_seed is not None:
         seed_message.append(f"Setting fewshot manual seed to {fewshot_random_seed}")
@@ -401,7 +402,7 @@ def simple_evaluate(
             "model_args": model_args,
         }
         # add more detailed model info if available
-        if isinstance(lm, lm_eval.models.huggingface.HFLM):
+        if hasattr(lm, "get_model_info"):
             results["config"].update(lm.get_model_info())
         # add info about execution
         results["config"].update(
@@ -434,11 +435,11 @@ def simple_evaluate(
 def evaluate(
     lm: "LM",
     task_dict,
-    limit: Optional[int] = None,
-    samples: Optional[dict] = None,
+    limit: int | None = None,
+    samples: dict | None = None,
     cache_requests: bool = False,
     rewrite_requests_cache: bool = False,
-    bootstrap_iters: Optional[int] = 100000,
+    bootstrap_iters: int | None = 100000,
     write_out: bool = False,
     log_samples: bool = True,
     system_instruction: Optional[str] = None,
@@ -520,12 +521,11 @@ def evaluate(
     }
     # get lists of group hierarchy and each type of request
     eval_tasks = get_task_list(task_dict)
-    if not log_samples:
-        if not all(
-            "bypass" not in getattr(task_output.task, "_metric_fn_list", {}).keys()
-            for task_output in eval_tasks
-        ):
-            raise ValueError("log_samples must be True for 'bypass' metric-only tasks")
+    if not log_samples and not all(
+        "bypass" not in getattr(task_output.task, "_metric_fn_list", {})
+        for task_output in eval_tasks
+    ):
+        raise ValueError("log_samples must be True for 'bypass' metric-only tasks")
 
     # validation checks:
     # 1.are we running multimodal task <-> non-multimodal model class, or vice-versa.
@@ -571,7 +571,7 @@ def evaluate(
             pass_multimodal_args_to_chat_history=pass_multimodal_args_to_chat_history,
             replace_videos_with_images_amount=replace_videos_with_images_amount,
             fewshot_as_multiturn=fewshot_as_multiturn,
-            chat_template=getattr(lm, "apply_chat_template")
+            chat_template=getattr(lm, "apply_chat_template", None)
             if apply_chat_template
             else None,
             tokenizer_name=getattr(lm, "tokenizer_name", "")
@@ -594,6 +594,8 @@ def evaluate(
             # split requests into two groups: with and without context
             requests[task_type_id][reqtype].append(instance)
         if not USE_TP and lm.world_size > 1:
+            import torch
+
             instances_rnk = torch.tensor(len(task._instances), device=lm.device)
             gathered_item = (
                 lm.accelerator.gather(instances_rnk).cpu().detach().numpy().tolist()
@@ -629,10 +631,10 @@ def evaluate(
             if task_type == DEFAULT_TYPE_ID:
                 # run all requests through model
                 resps = getattr(lm, reqtype)(cloned_reqs)
+	        # put responses from model into a list of length K for each request.
+       		 for x, req in zip(resps, cloned_reqs, strict=True):
+           	 	req.resps.append(x)
 
-                # put responses from model into a list of length K for each request.
-                for x, req in zip(resps, cloned_reqs):
-                    req.resps.append(x)
             # context tasks require separate reqs processing
             else:
                 # needed to store lm outputs
@@ -666,7 +668,7 @@ def evaluate(
 
     ### Postprocess outputs ###
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
-    for task_output, limit in zip(eval_tasks, limits):
+    for task_output, limit in zip(eval_tasks, limits, strict=True):
         task = task_output.task
         task.apply_filters()
 
@@ -681,7 +683,7 @@ def evaluate(
         for instances in instances_by_doc_id.values():
             instances.sort(key=lambda x: x.idx)
         # iterate over different filters used
-        for filter_key in task.instances[0].filtered_resps.keys():
+        for filter_key in task.instances[0].filtered_resps:
             indices = (
                 samples.get(task_output.task_name, None)
                 if samples is not None
@@ -694,10 +696,7 @@ def evaluate(
                 samples=indices,
             )
             for doc_id, doc in doc_iterator:
-                if indices:
-                    doc_id_true = indices[doc_id]
-                else:
-                    doc_id_true = doc_id
+                doc_id_true = indices[doc_id] if indices else doc_id
                 requests = instances_by_doc_id[doc_id]
                 metrics = task.process_results(
                     doc, [req.filtered_resps[filter_key] for req in requests]
@@ -732,6 +731,8 @@ def evaluate(
                     task_output.sample_metrics[(metric, filter_key)].append(value)
 
     if not USE_TP and WORLD_SIZE > 1:
+        import torch
+
         # if multigpu, then gather data across all ranks to rank 0
         # first gather logged samples across all ranks
         for task_output in eval_tasks:
@@ -796,7 +797,7 @@ def evaluate(
             ):  # subtask list will list "task_name": [] for solo tasks
                 for task in task_list:
                     for m, h in higher_is_better[task].items():
-                        if m not in _higher_is_better.keys():
+                        if m not in _higher_is_better:
                             _higher_is_better[m] = h
 
                         if (
@@ -830,7 +831,7 @@ def evaluate(
                         len(task_output.task.eval_docs),
                     ),
                 }
-                for task_output, limit in zip(eval_tasks, limits)
+                for task_output, limit in zip(eval_tasks, limits, strict=True)
             },
         }
         if log_samples:
