@@ -1,11 +1,29 @@
-import librosa
 import logging
+eval_logger = logging.getLogger(__name__)
+
+try:
+    import librosa
+except ImportError:
+    librosa = None
+    eval_logger.warning(
+        "librosa is not installed. If you are not running audio evaluation, you can ignore this. "
+        "If you are running audio tasks, install it via: pip install librosa soundfile"
+    )
+    
 import os
 import copy
 import json
 from typing import Dict, List, Optional, Tuple, Union
 
-import soundfile as sf
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
+    eval_logger.warning(
+        "soundfile is not installed. If you are not running audio evaluation, you can ignore this. "
+        "If you are running audio tasks, install via: pip install librosa soundfile"
+    )
+
 import torch
 import transformers
 from tqdm import tqdm
@@ -25,7 +43,6 @@ HF_HOME = os.getenv("HF_HOME", "~/.cache/huggingface/")
 HF_TASK_CACHE_DIR = "audio_data"
 CACHE_PATH = os.path.join(os.path.expanduser(HF_HOME), HF_TASK_CACHE_DIR)
 
-eval_logger = logging.getLogger(__name__)
 
 
 def process_audios(y, orig_sr, target_sr=16000):

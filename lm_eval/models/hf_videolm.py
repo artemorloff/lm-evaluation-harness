@@ -6,7 +6,20 @@ from typing import List, Optional, Tuple, Union, Dict
 import numpy as np
 import torch
 import torchvision
-import torchcodec
+
+eval_logger = logging.getLogger(__name__)
+
+
+try:
+    import torchcodec
+except ImportError:
+    torchcodec = None
+    eval_logger.warning(
+        "torchcodec is not installed. It is required only for video evaluation. "
+        "If you are not running video tasks, you can ignore this. "
+        "If you are running video evaluation, install via: pip install torchcodec"
+    )
+    
 from tqdm import tqdm
 from transformers import AutoModelForPreTraining, PreTrainedModel, AutoModelForVision2Seq
 
@@ -19,9 +32,6 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 from lm_eval.api.task import DEFAULT_VIDEO_PLACEHOLDER
-
-
-eval_logger = logging.getLogger(__name__)
 
 
 @register_model("hf_videolm")
