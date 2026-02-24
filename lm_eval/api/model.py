@@ -47,7 +47,6 @@ except ImportError:
 
     
 import torchvision.io as tvio
-    decord = None
 from tqdm import tqdm
 
 from lm_eval import utils
