@@ -20,9 +20,9 @@ try:
 except ImportError:
     AudioDecoder = None
     eval_logger.warning(
-        "torchcodec is not installed. It is required only for audio evaluation. "
+        "Audio evaluation requires `datasets` and `torchcodec`. "
         "If you are not running audio tasks, you can ignore this. "
-        "If you are running audio evaluation, install via: pip install torchcodec"
+        "If you are running audio evaluation, install via: pip install datasets torchcodec"
     )
 # Imports for video caching
 try:
