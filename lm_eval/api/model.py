@@ -10,15 +10,43 @@ import io
 import base64
 from PIL.Image import Image
 
+eval_logger = logging.getLogger(__name__)
+
+
 # Imports for audio caching
 import torch
-from datasets.features._torchcodec import AudioDecoder
-
+try:
+    from datasets.features._torchcodec import AudioDecoder
+except ImportError:
+    AudioDecoder = None
+    eval_logger.warning(
+        "Audio evaluation requires `datasets` and `torchcodec`. "
+        "If you are not running audio tasks, you can ignore this. "
+        "If you are running audio evaluation, install via: pip install datasets torchcodec"
+    )
 # Imports for video caching
-from torchcodec.decoders._video_decoder import VideoDecoder
-import decord
-import torchvision.io as tvio
+try:
+    from torchcodec.decoders._video_decoder import VideoDecoder
+except ImportError:
+    VideoDecoder = None
+    eval_logger.warning(
+        "torchcodec is not installed. It is required only for video evaluation. "
+        "If you are not running video tasks, you can ignore this. "
+        "If you are running video evaluation, install via: pip install torchcodec"
+    )
+    
+try:
+    import decord
+except ImportError:
+    decord = None
+    eval_logger.warning(
+        "decord is not installed. It is required only for video evaluation. "
+        "If you are not running video tasks, you can ignore this. "
+        "If you are running video evaluation, install via: pip install decord"
+    )
 
+    
+import torchvision.io as tvio
 from tqdm import tqdm
 
 from lm_eval import utils
@@ -29,8 +57,6 @@ if TYPE_CHECKING:
 
     from lm_eval.api.instance import Instance
 
-
-eval_logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="LM")
 
