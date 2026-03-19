@@ -460,17 +460,30 @@ class TemplateAPI(TemplateLM):
 
         for el in result:
             for message in el["messages"]:
+                raw_content = message.get("content", "")
+                if isinstance(raw_content, str):
+                    message["content"] = [{"type": "text", "text": raw_content}]
+                elif isinstance(raw_content, dict):
+                    message["content"] = [raw_content]
+                elif not isinstance(raw_content, list):
+                    raise ValueError(
+                        f"Invalid message content type: expected str/list/dict, got {type(raw_content).__name__}."
+                    )
+
                 for i, content in enumerate(message["content"]):
+                    if not isinstance(content, dict):
+                        raise ValueError(
+                            f"Invalid content item at index {i}: expected dict, got {type(content).__name__}."
+                        )
                     if content["type"] not in {"text", "image_url", "audio_url", "video_url"}:
                         raise ValueError(
                             f"Unsupported content type '{content['type']}'. "
-                            "Expected one of: 'text', 'image_url', 'audio_url'."
+                            "Expected one of: 'text', 'image_url', 'audio_url', 'video_url'."
                         )
                     if content["type"] == "text" and not isinstance(content["text"], str):
                         actual = type(content[content["type"]]).__name__
                         raise ValueError(
-                            f"Invalid payload for type '{content['type']}': "
-                            f"expected a dict, got {actual}."
+                            f"Invalid payload for type '{content['type']}': expected a string, got {actual}."
                         )
                     if content["type"] != "text" and not isinstance(content[content["type"]], dict):
                         actual = type(content[content["type"]]).__name__
