@@ -17,7 +17,10 @@ from lm_eval.models.utils import (
 )
 from lm_eval.models.vllm_causallms import VLLM
 
-from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
+try:
+    from vllm.tokenizers.mistral import MistralTokenizer
+except ImportError:  # vLLM < 0.19
+    from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 eval_logger = logging.getLogger(__name__)
 

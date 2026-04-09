@@ -51,7 +51,10 @@ try:
 except ModuleNotFoundError:
     pass
 
-from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
+try:
+    from vllm.tokenizers.mistral import MistralTokenizer
+except ImportError:  # vLLM < 0.19
+    from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 if TYPE_CHECKING:
     pass
@@ -354,7 +357,14 @@ class VLLM(TemplateLM):
         if not string:
             return []
         truncation = kwargs.pop("truncation", False)
-        _string = [string] if isinstance(string, str) else string
+        # zip(...) yields a tuple; treat (list, tuple) of str like a batch of prompts, not chat dicts
+        _string = (
+            [string]
+            if isinstance(string, str)
+            else list(string)
+            if isinstance(string, tuple)
+            else string
+        )
         _bos_token = self.tokenizer.decode(self.prefix_token_id)
         # if not add_special_tokens:
         #     add_special_tokens = False or self.add_bos_token
@@ -362,7 +372,11 @@ class VLLM(TemplateLM):
             add_special_tokens = bool(self.add_bos_token)
         else:
             add_special_tokens = bool(add_special_tokens)
-        if isinstance(string, str) or (isinstance(string, list) and string and isinstance(string[0], str)):
+        if isinstance(string, str) or (
+            isinstance(string, (list, tuple))
+            and string
+            and isinstance(string[0], str)
+        ):
             encoding: Union[List[List[int]], List[int]] = self.tokenizer(
                 _string,
                 add_special_tokens=add_special_tokens,

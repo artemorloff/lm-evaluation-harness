@@ -8,11 +8,12 @@ import torch
 import torchvision
 import torchcodec
 from tqdm import tqdm
-from transformers import AutoModelForPreTraining, PreTrainedModel, AutoModelForVision2Seq
+from transformers import AutoModelForPreTraining, PreTrainedModel
 
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.hf_vlms import HFMultimodalLM
+from lm_eval.models.transformers_compat import AutoModelForVision2Seq
 from lm_eval.models.utils import (
     Collator,
     handle_stop_sequences,

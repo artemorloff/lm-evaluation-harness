@@ -12,6 +12,7 @@ from transformers import BatchEncoding
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
+from lm_eval.models.transformers_compat import AutoModelForVision2Seq
 from lm_eval.models.utils import (
     Collator,
     flatten_image_list,
@@ -32,7 +33,7 @@ class HFMultimodalLM(HFLM):
     An abstracted Hugging Face model class for multimodal LMs like Llava and Idefics.
     """
 
-    AUTO_MODEL_CLASS = transformers.AutoModelForVision2Seq
+    AUTO_MODEL_CLASS = AutoModelForVision2Seq
     MULTIMODAL = True  # flag to indicate, for now, that this model type can run multimodal requests
 
     def __init__(

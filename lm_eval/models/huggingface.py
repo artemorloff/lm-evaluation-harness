@@ -30,6 +30,7 @@ from transformers.models.auto.modeling_auto import (
 from lm_eval import utils
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
+from lm_eval.models.transformers_compat import AutoModelForVision2Seq
 from lm_eval.models.utils import (
     Collator,
     _add_special_kwargs,
