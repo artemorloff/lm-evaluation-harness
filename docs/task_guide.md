@@ -232,9 +232,13 @@ Metrics:
 - `bits_per_byte`
 - `matthews_corrcoef` (Matthews correlation coefficient)
 - `f1` (F1 score)
-- `bleu`
+- `bleu` (corpus BLEU via sacrebleu; see note below)
 - `chrf`
 - `ter`
+- `exact_match`, `rouge`, `f1_gen` (for `generate_until`; `f1_gen` uses SQuAD-style token F1)
+- `embedding_cosine`, `levenshtein`, `llm_judge`, `meteor`, `bertscore`, `comet`, `bleurt`, `token_overlap_f1`, `sentence_bleu` (see [GENERATIVE_METRICS.md](./GENERATIVE_METRICS.md) — optional extras and API keys)
+
+**Corpus vs per-example scores:** Metrics such as **`bleu`**, **`chrf`**, and **`ter`** use a **passthrough** metric function and a **corpus-level** aggregation (`bleu`, `chrf`, `ter`) over all examples. Metrics such as **`exact_match`**, **`rouge`**, **`f1_gen`**, **`sentence_bleu`**, and the generative metrics in the list above compute a **score per document** and typically use aggregation **`mean`**. Do not confuse corpus **`bleu`** with **`sentence_bleu`** (per-sentence sacreBLEU, then averaged).
 
 Aggregation functions:
 
@@ -243,6 +247,8 @@ Aggregation functions:
 - `perplexity`
 - `weighted_perplexity`
 - `bits_per_byte`
+- `bleu`, `chrf`, `ter` (corpus-level for MT-style metrics)
+- `f1`, `matthews_corrcoef` (multiclass / sequence aggregation as defined in `metrics.py`)
 
 ### Adding a Multiple Choice Metric
 

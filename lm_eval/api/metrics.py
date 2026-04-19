@@ -242,6 +242,56 @@ def exact_match_hf_evaluate(
     return {"exact_match": np.mean(score_list)}
 
 
+def compute_f1_gen(predictions, references):
+    # Lazy import: transformers pulls sklearn/pandas; keep import-time stack light for tests/tools.
+    from transformers.data.metrics import squad_metrics
+
+    # squad_metrics.compute_f1(prediction, ground_truth)
+    score_list = [
+        squad_metrics.compute_f1(pred, ref)
+        for pred, ref in zip(predictions, references)
+    ]
+    return {"f1_gen": float(np.mean(score_list))}
+
+
+def compute_rouge_fn(
+    predictions,
+    references,
+    regexes_to_ignore=None,
+    ignore_case=False,
+    ignore_punctuation=False,
+    ignore_numbers=False,
+    rouge_type="rouge1",
+):
+    if regexes_to_ignore is not None:
+        for s in regexes_to_ignore:
+            predictions = np.array([re.sub(s, "", x) for x in predictions])
+            references = np.array([re.sub(s, "", x) for x in references])
+    else:
+        predictions = np.asarray(predictions)
+        references = np.asarray(references)
+
+    if ignore_case:
+        predictions = np.char.lower(predictions)
+        references = np.char.lower(references)
+
+    if ignore_punctuation:
+        repl_table = string.punctuation.maketrans("", "", string.punctuation)
+        predictions = np.char.translate(predictions, table=repl_table)
+        references = np.char.translate(references, table=repl_table)
+
+    if ignore_numbers:
+        repl_table = string.digits.maketrans("", "", string.digits)
+        predictions = np.char.translate(predictions, table=repl_table)
+        references = np.char.translate(references, table=repl_table)
+
+    from rouge_score import rouge_scorer
+
+    scorer = rouge_scorer.RougeScorer([rouge_type], use_stemmer=True)
+    score_list = [scorer.score(pack[0], pack[1])[rouge_type].fmeasure for pack in zip(references, predictions)]
+    
+    return {"rouge": np.mean(score_list)}
+    
 ###
 
 
@@ -253,6 +303,26 @@ def exact_match_hf_evaluate(
 )
 def exact_match_fn(**kwargs):
     return exact_match_hf_evaluate(**kwargs)
+
+
+@register_metric(
+    metric="f1_gen",
+    higher_is_better=True,
+    output_type="generate_until",
+    aggregation="mean",
+)
+def f1_gen_fn(**kwargs):
+    return compute_f1_gen(**kwargs)
+
+
+@register_metric(
+    metric="rouge",
+    higher_is_better=True,
+    output_type="generate_until",
+    aggregation="mean",
+)
+def rouge_fn(**kwargs):
+    return compute_rouge_fn(**kwargs)
 
 
 @register_metric(
@@ -637,3 +707,7 @@ def aggregate_subtask_metrics(metrics, sizes, weight_by_size=True):
     assert len(metrics) == len(sizes)
 
     return sum([metric * size for metric, size in zip(metrics, sizes)]) / sum(sizes)
+
+
+# Register optional generative metrics (embedding API, Levenshtein, METEOR, BERTScore, COMET, BLEURT, …).
+import lm_eval.api.metrics_generative  # noqa: E402, F401

@@ -18,6 +18,7 @@ classifiers = [
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
+    "numpy>=1.26.0,<1.27",
     "datasets>=2.16.0",
     "evaluate>=0.4.0",
     "jinja2",
@@ -92,6 +93,14 @@ tasks = [
     "lm_eval[math]",
     "lm_eval[multilingual]",
     "lm_eval[ruler]",
+]
+# Generative / reference-based text metrics (METEOR, BERTScore, COMET, Levenshtein, …).
+# API-based metrics (embedding_cosine, llm_judge) also need: pip install lm_eval[api]
+generative_metrics = [
+    "rapidfuzz>=3.0.0",
+    "nltk>=3.9.1",
+    "bert-score>=0.3.13",
+    "unbabel-comet>=2.2.0",
 ]
 
 [dependency-groups]
