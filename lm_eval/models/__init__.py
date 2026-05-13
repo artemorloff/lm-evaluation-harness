@@ -49,6 +49,7 @@ MODEL_MAPPING = {
     "textsynth": "lm_eval.models.textsynth:TextSynthLM",
     "vllm": "lm_eval.models.vllm_causallms:VLLM",
     "vllm-vlm": "lm_eval.models.vllm_vlms:VLLM_VLM",
+    "jsonl_cached": "lm_eval.models.jsonl_cached_model:JSONLCachedModel",
     "watsonx_llm": "lm_eval.models.ibm_watsonx_ai:IBMWatsonxAI",
     "gigachat-completion": "lm_eval.models.gigachat:GigaChatLM",
     "gigachat-chat": "lm_eval.models.gigachat:GigaChatAPI",
