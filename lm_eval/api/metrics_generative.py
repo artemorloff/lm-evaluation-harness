@@ -131,7 +131,8 @@ def compute_llm_judge(
     references,
     api_base: str,
     model: str,
-    judge_prompt: str,
+    judge_prompt_path: str | None = None,
+    instruction: str = "",
     api_key: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 256,
@@ -139,46 +140,63 @@ def compute_llm_judge(
     score_regex: str | None = None,
     **_: Any,
 ):
-    """LLM-as-judge via OpenAI-compatible `/v1/chat/completions`.
+    if not api_base or not model:
+        raise ValueError("llm_judge requires `api_base` and `model`")
 
-    `judge_prompt` must include `{reference}` and `{prediction}` placeholders.
-    """
-    if not api_base or not model or not judge_prompt:
-        raise ValueError(
-            "llm_judge requires `api_base`, `model`, and `judge_prompt` (with {reference} and {prediction})"
-        )
+    judge_prompt_path = (
+        judge_prompt_path
+        or os.getenv("LM_EVAL_JUDGE_PROMPT_PATH")
+        or os.getenv("pollux_prompt_path")
+    )
+
+    if not judge_prompt_path:
+        raise ValueError("Need judge_prompt_path")
+
+    with open(judge_prompt_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    prompt_template = data["pollux_prompt"]["template"]
+    criteria_name = data["pollux_prompt"]["criteria_name"]
+    criteria_rubrics = data["pollux_prompt"]["criteria_rubrics"]
+
+    pred = str(predictions[0] if predictions else "")
+    ref = str(references[0] if references else "")
+
+    prompt = prompt_template.format(
+        instruction=instruction,
+        reference_answer=ref,
+        answer=pred,
+        criteria_name=criteria_name,
+        criteria_rubrics=criteria_rubrics,
+    )
+
     requests = _require_requests()
-    pred = predictions[0] if predictions else ""
-    ref = references[0] if references else ""
-    prompt = judge_prompt.format(reference=ref, prediction=pred)
-    key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LM_EVAL_JUDGE_API_KEY") or ""
+
+    key = api_key or os.getenv("LM_EVAL_JUDGE_API_KEY") or ""
     url = f"{api_base.rstrip('/')}/v1/chat/completions"
+
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
+
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     resp.raise_for_status()
-    data = resp.json()
-    content = data["choices"][0]["message"]["content"]
-    if score_regex:
-        m = re.search(score_regex, content, re.IGNORECASE | re.DOTALL)
-        if m:
-            for g in m.groups():
-                if g is not None:
-                    return {"llm_judge": float(g)}
-        raise ValueError(
-            f"llm_judge score_regex did not match model output: {content[:500]!r}"
-        )
-    floats = re.findall(r"(\d+(?:\.\d+)?)", content)
-    if floats:
-        return {"llm_judge": float(floats[-1])}
-    raise ValueError(f"llm_judge could not parse a numeric score from: {content[:500]!r}")
+
+    content = resp.json()["choices"][0]["message"]["content"]
+    score_regex = r"\b([0-2])\b"
+    
+    m = re.search(score_regex, content, re.IGNORECASE | re.DOTALL)
+    if m:
+        return {"llm_judge": float(m.group(1)) / 2}
+    
+    raise ValueError(f"Cannot parse score: {content[:300]!r}")
 
 
 def compute_meteor(predictions, references, **_: Any):
