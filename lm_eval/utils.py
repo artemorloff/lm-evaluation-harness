@@ -13,6 +13,7 @@ from collections.abc import Callable, Generator
 from dataclasses import asdict, is_dataclass
 from itertools import islice
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -30,6 +31,13 @@ HIGHER_IS_BETTER_SYMBOLS = {
 
 # Track whether logging has been configured to avoid duplicate handlers
 _LOGGING_CONFIGURED = False
+
+# YAML configs commonly reference several functions from the same local module.
+# Importing that file once per ``!function`` tag repeats module-level side effects,
+# including registry decorators. Cache by canonical path so modules with generic
+# names such as ``utils`` in different task directories remain distinct.
+_YAML_MODULE_CACHE: dict[Path, ModuleType] = {}
+_YAML_MODULE_CACHE_LOCK = threading.RLock()
 
 
 class _LMEvalFormatter(logging.Formatter):
@@ -510,17 +518,27 @@ def import_function(loader: yaml.Loader, node, yaml_path: Path):
     *module_name, function_name = function_name.split(".")
     if isinstance(module_name, list):
         module_name = ".".join(module_name)
-    module_path = yaml_path.parent / f"{module_name}.py"
+    module_path = (yaml_path.parent / f"{module_name}.py").resolve()
 
-    spec = importlib.util.spec_from_file_location(module_name, module_path.as_posix())
+    with _YAML_MODULE_CACHE_LOCK:
+        module = _YAML_MODULE_CACHE.get(module_path)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(
+                module_name, module_path.as_posix()
+            )
 
-    if spec is None:
-        raise ImportError(f"Could not import module {module_name} from {module_path}.")
-    module = importlib.util.module_from_spec(spec)
+            if spec is None:
+                raise ImportError(
+                    f"Could not import module {module_name} from {module_path}."
+                )
+            module = importlib.util.module_from_spec(spec)
 
-    if spec.loader is None:
-        raise ImportError(f"Module loader is None, {module_name} from {module_path}.")
-    spec.loader.exec_module(module)
+            if spec.loader is None:
+                raise ImportError(
+                    f"Module loader is None, {module_name} from {module_path}."
+                )
+            spec.loader.exec_module(module)
+            _YAML_MODULE_CACHE[module_path] = module
 
     function = getattr(module, function_name)
     return function
