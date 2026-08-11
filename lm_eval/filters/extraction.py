@@ -122,6 +122,41 @@ class WhitespaceFilter(Filter):
         return filtered_resps
 
 
+@register_filter("remove_whitespace_and_nones")
+class WhitespaceAndNonesFilter(Filter):
+    """Strips leading whitespace and turns a missing response into "".
+
+    The first stage of the MERA filter chain, in front of ``take_first``. It
+    does two things and deliberately nothing else:
+
+    * ``lstrip()`` — models sometimes prepend a space to the answer;
+    * ``None`` (no completion returned) becomes ``""`` so that everything
+      downstream can assume a string and does not raise.
+
+    Extracting the answer out of the response is **not** done here. A response
+    may be free-form and may contain the "Ответ:" marker any number of times,
+    so the choice between the whole response and the part after the marker
+    belongs to the metric, which can score both and keep the better one. A
+    filter cannot: whatever it discards is gone before ``process_results``
+    runs, and it is the filtered text that is written to the submission.
+    """
+
+    def apply(self, resps: list[list[str]], docs: list[dict]) -> list[list[str]]:
+        def filter_set(inst):
+            filtered_resp = []
+            for resp in inst:
+                if not resp:
+                    resp = ""
+                else:
+                    resp = resp.lstrip()
+                filtered_resp.append(resp)
+            return filtered_resp
+
+        filtered_resps = [filter_set(resp) for resp in resps]
+
+        return filtered_resps
+
+
 @register_filter("multi_choice_regex")
 class MultiChoiceRegexFilter(RegexFilter):
     """

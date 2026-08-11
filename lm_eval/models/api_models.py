@@ -510,6 +510,11 @@ class TemplateAPI(TemplateLM):
         )
         cache_method = "generate_until" if generate else "loglikelihood"
         acquired = await sem.acquire()
+        # Bound before the request: a connection-level failure (proxy, DNS,
+        # 4xx/5xx, timeout) never reaches the assignment below, and the error
+        # handler interpolates this name — leaving it unbound replaced the real
+        # exception with an UnboundLocalError and hid the actual cause.
+        outputs = None
         try:
             async with session.post(
                 self.base_url,
