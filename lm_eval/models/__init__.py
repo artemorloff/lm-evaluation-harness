@@ -52,6 +52,9 @@ MODEL_MAPPING = {
     "watsonx_llm": "lm_eval.models.ibm_watsonx_ai:IBMWatsonxAI",
     "gigachat-completion": "lm_eval.models.gigachat:GigaChatLM",
     "gigachat-chat": "lm_eval.models.gigachat:GigaChatAPI",
+    "openrouter": "lm_eval.models.openrouter:OpenRouterLM",
+    "openrouter-chat": "lm_eval.models.openrouter:OpenRouterLM",
+    "openrouter-batch": "lm_eval.models.openrouter:OpenRouterLM",
 }
 
 
