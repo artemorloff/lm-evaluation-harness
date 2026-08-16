@@ -129,6 +129,7 @@ class OpenRouterLM(LocalChatCompletion):
         poll_seconds: float = 15.0,
         max_requests_per_batch: int = 500,
         max_wait_seconds: float = 86_400.0,
+        max_batch_hold: float = 50.0,
         preflight: Any = True,
         **kwargs,
     ) -> None:
@@ -175,6 +176,7 @@ class OpenRouterLM(LocalChatCompletion):
         self.poll_seconds = float(poll_seconds)
         self.max_requests_per_batch = int(max_requests_per_batch)
         self.max_wait_seconds = float(max_wait_seconds)
+        self.max_batch_hold = float(max_batch_hold)
         self.waited_seconds = 0.0
 
         # `simple_parse_args_string` splits model_args on every comma and never
@@ -285,6 +287,9 @@ class OpenRouterLM(LocalChatCompletion):
         pricing = catalogue[self.model].get("pricing") or {}
         out = float(pricing.get("completion") or 0) * 1e6
         inp = float(pricing.get("prompt") or 0) * 1e6
+        # Kept for sizing batches: submission reserves the worst case, so the
+        # per-request hold is max_tokens * this price.
+        self._price_out_per_token = float(pricing.get("completion") or 0)
         note = f"openrouter: {self.model} — ${inp:.2f}/${out:.2f} per 1M in/out"
         # A ':batch' variant is not always a discount. z-ai/glm-5.2:batch is
         # currently 52% MORE expensive than the plain model, because the plain
@@ -597,6 +602,29 @@ class OpenRouterLM(LocalChatCompletion):
                 }
             )
 
+        # Submitting a batch RESERVES the worst case — every request billed as
+        # if it used all of max_tokens — against the account's prepaid credit,
+        # not against the key's spending limit. So a chunk of 500 requests at
+        # max_tokens=65536 on a $12.50/1M model asks for a $410 hold and is
+        # refused with HTTP 402 however cheap the answers turn out to be.
+        # Measured: claude-opus-5 sobhard was refused at "$414.61 exceeds your
+        # available balance of $149.05". Size the chunk so the hold stays under
+        # `max_batch_hold` instead.
+        per_request = float(entries[0]["body"].get("max_tokens") or 0) * getattr(
+            self, "_price_out_per_token", 0.0
+        )
+        chunk_size = self.max_requests_per_batch
+        if per_request > 0 and self.max_batch_hold > 0:
+            affordable = max(int(self.max_batch_hold / per_request), 1)
+            if affordable < chunk_size:
+                chunk_size = affordable
+                eval_logger.info(
+                    f"batch: reserving ~${per_request:.2f} per request, so "
+                    f"chunking at {chunk_size} to keep the hold under "
+                    f"${self.max_batch_hold:.0f}"
+                )
+        self._chunk_size = chunk_size
+
         by_id: Dict[str, str] = {}
         progress = tqdm(total=len(entries), desc="Batch API", disable=disable_tqdm)
         self._run_entries(entries, by_id, progress)
@@ -625,8 +653,9 @@ class OpenRouterLM(LocalChatCompletion):
 
     def _run_entries(self, entries, by_id, progress) -> None:
         """Submit entries in chunks and fold their answers into `by_id`."""
-        for start in range(0, len(entries), self.max_requests_per_batch):
-            chunk = entries[start : start + self.max_requests_per_batch]
+        step = getattr(self, "_chunk_size", self.max_requests_per_batch)
+        for start in range(0, len(entries), step):
+            chunk = entries[start : start + step]
             batch_id = self._submit(chunk)
             eval_logger.info(f"batch {batch_id}: submitted {len(chunk)} requests")
             body = self._await(batch_id)
