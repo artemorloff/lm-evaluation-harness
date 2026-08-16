@@ -208,12 +208,21 @@ The backend does this per task:
    while lm-eval consumes the returned list positionally. Getting this wrong
    would attach every answer to the wrong document while every format check
    still passed.
-5. **Retry the blanks.** Any request that came back with no text is resubmitted
+5. **Cache the chunk**, before the next one is submitted, if `--use_cache` is
+   on. Blanks are left out, since they are still candidates for step 6.
+6. **Retry the blanks.** Any request that came back with no text is resubmitted
    as a second, smaller batch with the thinking budget reduced. Up to two extra
    rounds.
-6. **Journal.** The batch reports `cost` only for the job as a whole, so it is
+7. **Journal.** The batch reports `cost` only for the job as a whole, so it is
    divided across the results by token count. Without that, every batch row
    would record zero and a batch run would look free.
+
+Step 5 is what makes an interrupted batch survivable. lm-eval's own cache
+writes only after `generate_until` *returns*, so anything that stops a task
+throws away every answer already paid for and already in hand: measured on
+`gpt-5.6-sol`, a chunk refused at document 750 of 825 discarded the 750 answers
+behind it, $67.44 of them. With the per-chunk write a restart re-asks only the
+chunk that was in flight.
 
 ### The credit hold
 
@@ -234,6 +243,15 @@ with a $6000 monthly limit and $149 of credit can submit jobs worth $149. The
 balance is `total_credits - total_usage` from `GET /api/v1/credits`;
 `GET /api/v1/auth/key` reports the limit and will not tell you why a submission
 was refused.
+
+**The balance falls as the run spends it, so a long task can start comfortably
+and still be refused near the end.** `max_batch_hold` has to fit under the
+balance *minus whatever the rest of the run will cost*, not under today's
+balance. `gpt-5.6-sol` cleared twelve chunks of `sobhard` and was refused the
+thirteenth at "$50.68 exceeds your available balance of $48.83" — the cap was
+doing its job, the credit had simply been eaten by the run itself. Either fund
+the account for the whole task, or set the cap low enough that the last chunk
+still fits.
 
 **The refusal is an HTTP 402 that names a number you never intended to spend.**
 Measured on `claude-opus-5`, an 825-document task at `max_gen_toks=65536`: 500
