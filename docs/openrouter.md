@@ -89,6 +89,13 @@ elsewhere `effort` is the lever and a budget may simply be ignored.
 | `poll_seconds` | 15 | how often to ask whether the job is done |
 | `max_requests_per_batch` | 500 | split larger tasks across several jobs |
 | `max_wait_seconds` | 86400 | give up on a job that never finishes |
+| `max_batch_hold` | 50 | dollars a single job may reserve; see [the credit hold](#the-credit-hold) |
+
+`max_batch_hold` is a ceiling on the *reservation*, not on the spend. Submitting
+a job freezes the worst case against your prepaid credit, so on an expensive
+model the default `max_requests_per_batch=500` asks for far more than the run
+will ever cost and is refused. Raising this is only safe if the credit balance
+can absorb it; lowering it makes the run slower but never more expensive.
 
 ### `--gen_kwargs` — generation
 
@@ -192,7 +199,9 @@ The backend does this per task:
    `temperature`, `stop` and `seed` are identical to what a sync run would have
    sent. Each gets a `custom_id`.
 2. **Submit.** `POST /api/beta/batches` with `{"endpoint": "/v1/chat/completions",
-   "model": ..., "requests": [...]}`, chunked at `max_requests_per_batch`.
+   "model": ..., "requests": [...]}`, chunked at whichever is smaller:
+   `max_requests_per_batch`, or the number of requests whose combined
+   reservation stays under `max_batch_hold`. See [the credit hold](#the-credit-hold).
 3. **Poll.** `GET /api/beta/batches/{id}` every `poll_seconds` until the status
    is `completed`, `failed`, `cancelled` or `expired`. Results come back inline.
 4. **Match by `custom_id`.** Never by position — the API does not promise order,
@@ -205,6 +214,49 @@ The backend does this per task:
 6. **Journal.** The batch reports `cost` only for the job as a whole, so it is
    divided across the results by token count. Without that, every batch row
    would record zero and a batch run would look free.
+
+### The credit hold
+
+Submitting a batch **reserves the worst case**: every request is held as if it
+were going to spend all of `max_tokens`, at the model's output price. The
+reservation is released when the job finishes and only the real usage is
+charged — but until then it has to fit.
+
+```
+hold = requests x max_tokens x output price per token
+```
+
+Two things about that hold are easy to get wrong, and both were learned the
+expensive way:
+
+**It is taken from prepaid credit, not from the key's spending limit.** A key
+with a $6000 monthly limit and $149 of credit can submit jobs worth $149. The
+balance is `total_credits - total_usage` from `GET /api/v1/credits`;
+`GET /api/v1/auth/key` reports the limit and will not tell you why a submission
+was refused.
+
+**The refusal is an HTTP 402 that names a number you never intended to spend.**
+Measured on `claude-opus-5`, an 825-document task at `max_gen_toks=65536`: 500
+requests × 65536 tokens × $12.50/1M ≈ $410, refused with *"$414.61 exceeds your
+available balance of $149.05"*. Once chunked, that same task completed for
+$103.95 — the hold was four times the bill it was guarding against.
+
+So the backend sizes each chunk to keep the hold under `max_batch_hold` before
+submitting, and logs the arithmetic when it does:
+
+```
+batch: reserving ~$0.82 per request, so chunking at 61 to keep the hold under $50
+```
+
+The cost is wall-clock. Each chunk is a separate job with its own unpredictable
+wait, so those 825 documents go out as fourteen jobs of 61 rather than two of
+500, and take correspondingly longer. That is the trade: a slower run that
+completes, instead of a fast one that is refused. If the account has plenty of
+credit, raise `max_batch_hold` and the chunks grow back.
+
+Note that a small `max_gen_toks` shrinks the hold as effectively as a small
+chunk does — but it is not a free lever, because a tight thinking budget is
+itself a source of blanks (see [Empty answers](#empty-answers)).
 
 ### What to expect
 
@@ -279,3 +331,13 @@ and cannot be disabled` — and a 400 reaches lm-eval as a `ClientResponseError`
 that aborts the whole task. A rescue attempt must not be able to destroy the run
 it exists to save; for the same reason, a 4xx caused by a modified payload is
 retried once with the original.
+
+Some blanks are not the budget and no retry will move them. A model may decline
+a prompt it is free to decline: `claude-opus-5` returned `content_filter` on 163
+of 8679 MERA documents (1.9%), all of them ordinary API-routing questions with
+nothing objectionable in them. Retrying, switching between the Anthropic,
+Bedrock, Vertex and Azure providers, adding a benign system prompt and turning
+reasoning off all produced the same refusal, which places it in the model rather
+than in any one provider. Read `finish_reason` in the journal before spending a
+day trying to rescue such answers: `length` is worth another attempt,
+`content_filter` is the model's answer.
