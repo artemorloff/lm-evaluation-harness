@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import warnings
+from functools import wraps
 
 import requests  # needs to be imported in order to create gigachat temp acess_token
 from tqdm import tqdm
@@ -10,7 +11,6 @@ from tqdm import tqdm
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval.models.openai_completions import LocalChatCompletion
-from lm_eval.models.utils import retry_on_specific_exceptions
 
 
 logging.getLogger("httpx").setLevel(
@@ -22,6 +22,244 @@ warnings.filterwarnings(
 )  # turn off insecure connection warning if verify_certificate=False
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _coerce_model_arg(value):  # noqa: ANN001, ANN201
+    """Parse model_args values from CLI strings into Python objects."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if stripped.lower() == "true":
+        return True
+    if stripped.lower() == "false":
+        return False
+    if stripped.isnumeric():
+        return int(stripped)
+    try:
+        return float(stripped)
+    except ValueError:
+        pass
+    if stripped.startswith(("{", "[", '"', "'")):
+        try:
+            return json.loads(stripped.replace("'", '"'))
+        except json.JSONDecodeError:
+            import ast
+
+            try:
+                return ast.literal_eval(stripped)
+            except (SyntaxError, ValueError):
+                pass
+    return value
+
+
+# model_args that configure the client, or that generate_until passes to Chat()
+# itself. None of these belong in the payload built from **kwargs, and
+# trust_remote_code is added to model_args by the harness rather than by us.
+_NOT_PAYLOAD_KEYS = (
+    "model",
+    "base_url",
+    "scope",
+    "verify_ssl_certs",
+    "timeout",
+    "max_tokens",
+    "temperature",
+    "trust_remote_code",
+)
+
+
+#: Ceiling for the retry back-off, in seconds. `retry_on_specific_exceptions`
+#: multiplies its sleep by 1.5 forever, so a run of 429s walks it up to
+#: 3 -> 4.5 -> ... -> 173 -> 259 seconds. Observed live: with several workers on
+#: one token the gateway answers 429 steadily, and by the twelfth refusal a
+#: worker sleeps four minutes for a limit that resets in seconds. Capping is
+#: local to GigaChat on purpose — the shared helper serves every other model.
+_MAX_BACKOFF_SECONDS = 60.0
+_INITIAL_BACKOFF_SECONDS = 3.0
+_BACKOFF_MULTIPLIER = 1.5
+
+#: A 502 that arrives this late did not fail — it ran out of time. The gateway
+#: cuts a generation at about 300 seconds and answers 502; measured repeatedly
+#: at 288-301s. Retrying such a request replays the same wall, so these are
+#: given up on at once. A 502 that comes back quickly (12s was observed) is a
+#: transient gateway fault and is worth another attempt.
+#:
+#: The 502 half of that test is not decoration: under `stream=true` a request
+#: routinely outlives this threshold on purpose, and a mid-body disconnect
+#: ("incomplete chunked read", no status attached) must still be retried.
+_WALL_CLOCK_SECONDS = 280.0
+
+#: Attempts for failures that are *not* the wall. Beyond this the document is
+#: recorded as an empty answer so the task can finish; a run that hangs forever
+#: on one document measures nothing at all.
+_MAX_ATTEMPTS = 4
+
+
+def _error_status(exc) -> int | None:
+    """HTTP status carried by a gigachat ResponseError, if it carries one.
+
+    Read the attribute, not ``args``. ``ResponseError.__init__`` keeps url,
+    status_code, content and headers on the instance but calls
+    ``super().__init__(f"{status_code} {url}")`` — so ``args`` holds exactly one
+    formatted string, and indexing into it for the body raises. (The same
+    assumption in this module's ``parse_exception`` is broken for the same
+    reason.) Getting this wrong made every 429 look statusless, which spent a
+    retry attempt on it and recorded empty answers for documents the gateway had
+    merely asked us to send later.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _retry_with_capped_backoff(
+    on_exceptions,
+    on_exception_callback=None,
+    max_attempts=_MAX_ATTEMPTS,
+    give_up_value="",
+):
+    """Retry transient failures; give up on the ones that hit the gateway's wall.
+
+    Three behaviours, each earned from a measurement rather than assumed:
+
+    * the sleep never exceeds :data:`_MAX_BACKOFF_SECONDS`, because unbounded
+      exponential back-off walked to 259s under a run of 429s;
+    * a failure that took at least :data:`_WALL_CLOCK_SECONDS` is not retried at
+      all — around 11% of sobhard documents exceed the gateway's limit at every
+      max_tokens tried, and retrying them costs five minutes to learn nothing;
+    * anything still failing after `max_attempts` yields `give_up_value` instead
+      of raising, because `generate_until` turns a raised ResponseError into a
+      `break` that abandons every remaining document in the task.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            sleep_time = _INITIAL_BACKOFF_SECONDS
+            last_error = None
+            attempt = 0
+            while attempt < max_attempts:
+                started = time.time()
+                try:
+                    return func(*args, **kwargs)
+                except tuple(on_exceptions) as e:
+                    elapsed = time.time() - started
+                    last_error = e
+                    # A 429 says "not now", not "this request is bad". Waiting it
+                    # out is the whole remedy, so it must not consume an attempt:
+                    # bursts of 16-22 in a row were measured under contention,
+                    # and counting them would discard perfectly good documents.
+                    if _error_status(e) == 429:
+                        if on_exception_callback is not None:
+                            on_exception_callback(e, sleep_time)
+                        time.sleep(sleep_time)
+                        sleep_time = min(
+                            sleep_time * _BACKOFF_MULTIPLIER, _MAX_BACKOFF_SECONDS
+                        )
+                        continue
+                    # 401/403 is not the model failing, it is us not being
+                    # allowed to ask. Retrying cannot help and giving up writes
+                    # an empty answer that reads as a wrong answer: an expired
+                    # token silently turned 241 sobhard documents on
+                    # GigaChat-3-Ultra into blanks, and the run looked healthy
+                    # throughout. Fail loudly instead.
+                    if _error_status(e) in (401, 403):
+                        eval_logger.critical(
+                            "gigachat: %s from the API — the token is rejected "
+                            "(expired or wrong scope). Aborting instead of "
+                            "recording empty answers.",
+                            _error_status(e),
+                        )
+                        raise
+                    attempt += 1
+                    # The wall is a 502 from nginx at ~300s, and only that.
+                    # Elapsed time alone used to be enough to recognise it,
+                    # because without streaming nothing else could run that long
+                    # and still fail. With streaming a request legitimately lives
+                    # far longer (948s measured), and when the gateway drops it
+                    # mid-body the failure is an httpx protocol error carrying no
+                    # status — transient, and worth retrying. Classifying that as
+                    # the wall gave up instantly and wrote an empty answer:
+                    # measured at 1 of the first 5 streamed sobhard documents,
+                    # which over 703 of them is ~140 blanks that no retry policy
+                    # would ever revisit.
+                    if elapsed >= _WALL_CLOCK_SECONDS and _error_status(e) == 502:
+                        eval_logger.error(
+                            "gigachat: request hit the gateway wall after %.0fs; "
+                            "recording an empty answer without retrying. %s",
+                            elapsed,
+                            e,
+                        )
+                        return give_up_value
+                    if attempt == max_attempts:
+                        break
+                    if on_exception_callback is not None:
+                        on_exception_callback(e, sleep_time)
+                    time.sleep(sleep_time)
+                    sleep_time = min(
+                        sleep_time * _BACKOFF_MULTIPLIER, _MAX_BACKOFF_SECONDS
+                    )
+            eval_logger.error(
+                "gigachat: giving up after %d attempts, recording an empty "
+                "answer. Last error: %s",
+                max_attempts,
+                last_error,
+            )
+            return give_up_value
+
+        return wrapper
+
+    return decorator
+
+
+def _chat_field_names() -> set | None:
+    """Field names gigachat's Chat model declares, or None if it cannot be read."""
+    try:
+        from gigachat.models import Chat
+    except ModuleNotFoundError:
+        return None
+    fields = getattr(Chat, "model_fields", None)  # pydantic v2
+    if fields is None:
+        fields = getattr(Chat, "__fields__", None)  # pydantic v1
+    return set(fields) if fields else None
+
+
+def _normalize_gigachat_kwargs(kwargs: dict) -> dict:
+    """Map CLI-friendly model_args to GigaChat Chat() payload fields.
+
+    Anything the installed SDK's ``Chat`` model does not declare is routed
+    through ``additional_fields``, which ``gigachat.api.chat._build_request_json``
+    merges into the top level of the request body. Without that, pydantic drops
+    unknown keys silently: ``tools`` and ``model_options`` are not fields of
+    ``Chat`` in gigachat 0.2.3, so passing them directly meant they never
+    reached the API at all, with nothing in the logs to say so.
+    """
+    normalized = dict(kwargs)
+    for key, value in list(normalized.items()):
+        normalized[key] = _coerce_model_arg(value)
+
+    for key in _NOT_PAYLOAD_KEYS:
+        normalized.pop(key, None)
+
+    preset = normalized.pop("preset", None)
+    if preset is not None and "model_options" not in normalized:
+        normalized["model_options"] = {"preset": preset}
+
+    if "tools" in normalized and normalized["tools"] is None:
+        normalized["tools"] = []
+
+    known = _chat_field_names()
+    if known:
+        extra = {k: normalized.pop(k) for k in list(normalized) if k not in known}
+        if extra:
+            merged = dict(normalized.get("additional_fields") or {})
+            merged.update(extra)
+            normalized["additional_fields"] = merged
+
+    return normalized
 
 
 def gigachat_completion(
@@ -64,11 +302,18 @@ def gigachat_completion(
     try:
         import gigachat
         import httpx
+        import pydantic
     except ModuleNotFoundError:
         raise Exception(
             "attempted to use 'gigachat' LM type, but packages `gigachat` or `httpx` are not installed. \
 please install gigachat via `pip install lm-eval[gigachat]` or `pip install -e .[gigachat]`",
         )
+
+    kwargs = _normalize_gigachat_kwargs(kwargs)
+    # Client-side switch, not a payload field: gigachat's `stream()` sets
+    # `stream` on the request itself, and leaving it in kwargs would send it
+    # twice.
+    stream = bool(kwargs.pop("stream", False))
 
     messages = []
     if not chat_template_is_on:
@@ -94,12 +339,23 @@ please install gigachat via `pip install lm-eval[gigachat]` or `pip install -e .
             f"GigaChatError occurred: {e.__str__()}\n Retrying in {sleep_time} seconds"
         )
 
-    @retry_on_specific_exceptions(
+    @_retry_with_capped_backoff(
         on_exceptions=[
             httpx.ReadTimeout,  # it is like a RateLimitError
             httpx.ConnectTimeout,
+            gigachat.exceptions.ResponseError,
+            httpx.RemoteProtocolError,
+            # Under `stream=true` the gateway reports a mid-generation failure
+            # as a JSON object *inside* the SSE stream —
+            # {"status_code": 500, "message": "Internal Server Error"} — and the
+            # SDK feeds that to ChatCompletionChunk, which rejects it for four
+            # missing fields. The exception is a pydantic ValidationError, not a
+            # ResponseError, so without this entry it escapes the retry wrapper
+            # and `generate_until` aborts the whole task: GigaChat-3-Lightning
+            # lost all 825 sobhard documents to one such chunk. It is a
+            # transient 500, so it belongs here rather than in a `raise`.
+            pydantic.ValidationError,
         ],
-        max_retries=None,
         on_exception_callback=_exception_callback,
     )
     def completion():
@@ -108,10 +364,28 @@ please install gigachat via `pip install lm-eval[gigachat]` or `pip install -e .
             model=model,
             max_tokens=max_tokens_to_sample,
             temperature=temperature,
+            # profanity_check=False,
+            # tools=[],
+            # model_options={"preset": "default"},
             **kwargs,
         )
 
-        response = client.chat(payload).choices[0].message.content
+        if stream:
+            # The gateway ends a silent response at about 300 seconds and
+            # answers 502 — measured at 288-301s across dozens of requests, with
+            # the client timeout at 1800s, so the limit is theirs and waiting
+            # longer cannot help. Streaming keeps the connection producing
+            # chunks, so the read timeout never fires; it is the only lever that
+            # reaches those documents. 5% of sobhard is lost without it.
+            parts = []
+            for chunk in client.stream(payload):
+                for choice in chunk.choices or []:
+                    piece = getattr(choice.delta, "content", None)
+                    if piece:
+                        parts.append(piece)
+            response = "".join(parts)
+        else:
+            response = client.chat(payload).choices[0].message.content
 
         if until:
             response = cut_generation(response, until)
@@ -133,6 +407,7 @@ class GigaChatLM(LM):
         scope: str = "GIGACHAT_API_PERS",
         verify_ssl_certs: bool = False,
         base_url: str | None = None,
+        timeout: float = 200,
         **kwargs,  # top_p,  etc.
     ) -> None:
         """GigaChat API wrapper.
@@ -147,6 +422,11 @@ class GigaChatLM(LM):
             Set tokenscope. Possible values are: ['GIGACHAT_API_PERS', 'GIGACHAT_API_CORP', 'GIGACHAT_API_B2B']
         :param verify_ssl_certs: bool
             Set this parameter if you have your certificates installed to ensure greater security
+        :param timeout: float
+            HTTP read timeout in seconds. The default suits short answers; a task
+            that generates tens of thousands of characters (sobhard asks for
+            max_gen_toks 65536) needs far more, and a read timeout here costs the
+            full wait and then an exponential back-off before the retry.
         :param kwargs: Any
             Additional model_args to pass to the API client.
         """
@@ -167,11 +447,11 @@ please install gigachat via `pip install lm-eval[gigachat]` or `pip install -e .
             access_token=os.environ.get("GIGACHAT_TOKEN", None),
             scope=os.environ.get("GIGACHAT_SCOPE", scope),
             verify_ssl_certs=verify_ssl_certs,
-            timeout=200,
+            timeout=timeout,
         )
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.kwargs = kwargs
+        self.kwargs = _normalize_gigachat_kwargs(kwargs)
         self.chat_template_is_used = False
 
     @property
@@ -472,7 +752,35 @@ def cut_generation(generation, stop):
 
 
 def parse_exception(exp):
-    import ast
+    """Status code and message from a gigachat ResponseError.
 
-    exp_dict = ast.literal_eval(exp.args[2].decode("utf8"))
-    return exp_dict.get("status", exp.args[1]), exp_dict.get("message")
+    `ResponseError.__init__` keeps url, status_code, content and headers on the
+    instance but calls `super().__init__(f"{status_code} {url}")` — so `args`
+    holds exactly ONE formatted string. The previous body indexed `args[2]` and
+    `args[1]`, which raises `IndexError: tuple index out of range` for every
+    error it is handed.
+
+    That turned the one place this is called — the `except ResponseError` in
+    `generate_until` — into a landmine: a deliberate, correct 401 abort came out
+    as an unexplained IndexError traceback, and the actual cause (an expired
+    token) appeared nowhere in the failure. It cost two 20-hour sobhard runs
+    their diagnosis, on GigaChat-3-Ultra at document 206 of 296 and on
+    GigaChat-3.5 at 136 of 325.
+    """
+    status = getattr(exp, "status_code", None)
+    content = getattr(exp, "content", None)
+    if isinstance(content, (bytes, bytearray)):
+        content = content.decode("utf8", errors="replace")
+    message = None
+    if isinstance(content, str) and content.strip():
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            message = content[:300]
+        else:
+            if isinstance(parsed, dict):
+                status = parsed.get("status", status)
+                message = parsed.get("message") or parsed.get("error")
+            else:
+                message = content[:300]
+    return status, message if message is not None else str(exp)
