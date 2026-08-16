@@ -30,6 +30,7 @@ from transformers.models.auto.modeling_auto import (
 from lm_eval import utils
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
+from lm_eval.models.transformers_compat import AutoModelForVision2Seq
 from lm_eval.models.utils import (
     Collator,
     _add_special_kwargs,
@@ -960,7 +961,7 @@ class HFLM(TemplateLM):
 
             assert self.AUTO_MODEL_CLASS in (
                 transformers.AutoModelForCausalLM,
-                transformers.AutoModelForVision2Seq,
+                AutoModelForVision2Seq,
             )
             return self.model(inps).logits
 

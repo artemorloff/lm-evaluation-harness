@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Any
 
 import numpy as np
+import yaml
 
 from lm_eval.api.registry import register_metric
 
@@ -131,26 +132,69 @@ def compute_llm_judge(
     references,
     api_base: str,
     model: str,
-    judge_prompt: str,
+    judge_prompt: str | None = None,
+    judge_prompt_path: str | None = None,
+    instruction: str = "",
     api_key: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 256,
     timeout: float = 120.0,
     score_regex: str | None = None,
+    score_max: float | None = None,
     **_: Any,
 ):
     """LLM-as-judge via OpenAI-compatible `/v1/chat/completions`.
 
-    `judge_prompt` must include `{reference}` and `{prediction}` placeholders.
+    The prompt comes from one of two places:
+
+    * `judge_prompt` — a template with `{reference}` and `{prediction}`
+      placeholders, substituted here. The score is returned as the judge wrote
+      it, and the caller decides what scale it is on.
+    * `judge_prompt_path` — a YAML file holding a rubric under `pollux_prompt`
+      (`template`, `criteria_name`, `criteria_rubrics`), whose template is
+      filled with `instruction`, `reference_answer` and `answer` as well. The
+      rubric runs 0-2, so unless `score_max` says otherwise the score is
+      divided by 2 to land in [0, 1]. Also readable from
+      `LM_EVAL_JUDGE_PROMPT_PATH` or `pollux_prompt_path`.
+
+    `score_regex` overrides how the score is read in either case; its first
+    non-None group is the score. Without it, a rubric file is read as a single
+    digit 0-2 and a plain `judge_prompt` falls back to the last number in the
+    answer.
     """
-    if not api_base or not model or not judge_prompt:
-        raise ValueError(
-            "llm_judge requires `api_base`, `model`, and `judge_prompt` (with {reference} and {prediction})"
-        )
+    if not api_base or not model:
+        raise ValueError("llm_judge requires `api_base` and `model`")
+
     requests = _require_requests()
-    pred = predictions[0] if predictions else ""
-    ref = references[0] if references else ""
-    prompt = judge_prompt.format(reference=ref, prediction=pred)
+    pred = str(predictions[0] if predictions else "")
+    ref = str(references[0] if references else "")
+
+    if judge_prompt:
+        prompt = judge_prompt.format(reference=ref, prediction=pred)
+    else:
+        judge_prompt_path = (
+            judge_prompt_path
+            or os.getenv("LM_EVAL_JUDGE_PROMPT_PATH")
+            or os.getenv("pollux_prompt_path")
+        )
+        if not judge_prompt_path:
+            raise ValueError(
+                "llm_judge requires `judge_prompt` (with {reference} and "
+                "{prediction}) or `judge_prompt_path` (a rubric YAML)"
+            )
+        with open(judge_prompt_path, "r", encoding="utf-8") as f:
+            rubric = yaml.safe_load(f)["pollux_prompt"]
+        prompt = rubric["template"].format(
+            instruction=instruction,
+            reference_answer=ref,
+            answer=pred,
+            criteria_name=rubric["criteria_name"],
+            criteria_rubrics=rubric["criteria_rubrics"],
+        )
+        # Defaults for the rubric scale, both overridable by the caller.
+        score_regex = score_regex or r"\b([0-2])\b"
+        score_max = 2.0 if score_max is None else score_max
+
     key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LM_EVAL_JUDGE_API_KEY") or ""
     url = f"{api_base.rstrip('/')}/v1/chat/completions"
     headers = {"Content-Type": "application/json"}
@@ -166,18 +210,21 @@ def compute_llm_judge(
     resp.raise_for_status()
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
+    def scaled(value: float) -> dict:
+        return {"llm_judge": value / score_max if score_max else value}
+
     if score_regex:
         m = re.search(score_regex, content, re.IGNORECASE | re.DOTALL)
         if m:
             for g in m.groups():
                 if g is not None:
-                    return {"llm_judge": float(g)}
+                    return scaled(float(g))
         raise ValueError(
             f"llm_judge score_regex did not match model output: {content[:500]!r}"
         )
     floats = re.findall(r"(\d+(?:\.\d+)?)", content)
     if floats:
-        return {"llm_judge": float(floats[-1])}
+        return scaled(float(floats[-1]))
     raise ValueError(f"llm_judge could not parse a numeric score from: {content[:500]!r}")
 
 
