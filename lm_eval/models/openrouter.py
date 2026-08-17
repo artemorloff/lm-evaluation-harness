@@ -627,6 +627,14 @@ class OpenRouterLM(LocalChatCompletion):
 
         by_id: Dict[str, str] = {}
         progress = tqdm(total=len(entries), desc="Batch API", disable=disable_tqdm)
+        # Hand `_run_entries` what it needs to cache each chunk as it lands.
+        # Without this the only cache write is in `_collect`, after every chunk
+        # has come back — so anything that stops the task throws away work that
+        # is already paid for and already in hand. Measured: gpt-5.6-sol's
+        # sobhard was refused a chunk at 750 of 825 documents, and the 750
+        # answers behind it, $67.44 of them, were lost. The cache is what makes
+        # a restart resume rather than begin again.
+        self._cache_targets = (contexts, all_gen_kwargs)
         self._run_entries(entries, by_id, progress)
 
         # A batch answers once, so the per-request retry the synchronous path
@@ -688,8 +696,35 @@ class OpenRouterLM(LocalChatCompletion):
                     self._record(
                         inner, sent.get(custom_id) or {"model": self.model}, cost=share
                     )
+            self._cache_chunk(chunk, by_id)
             if progress is not None:
                 progress.update(len(chunk))
+
+    def _cache_chunk(self, chunk, by_id) -> None:
+        """Persist this chunk's answers before submitting the next one.
+
+        Only non-empty answers, matching what `_collect` writes: a blank is
+        still a candidate for the empty-answer retry rounds, and caching it
+        would freeze the failure in place for every future run.
+        """
+        contexts, all_gen_kwargs = getattr(self, "_cache_targets", (None, None))
+        if contexts is None:
+            return
+        for entry in chunk:
+            custom_id = entry.get("custom_id") or ""
+            if not custom_id.startswith("req-"):
+                continue
+            try:
+                index = int(custom_id[4:])
+            except ValueError:
+                continue
+            if index >= len(contexts):
+                continue
+            text = by_id.get(custom_id) or ""
+            if text.strip():
+                self.cache_hook.add_partial(
+                    "generate_until", (contexts[index], all_gen_kwargs[index]), text
+                )
 
     def _collect(self, contexts, all_gen_kwargs, by_id, total: int) -> List[str]:
         # By custom_id, never by position: the API does not promise order, and
