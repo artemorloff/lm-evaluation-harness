@@ -1,94 +1,131 @@
+from __future__ import annotations
+
+import inspect
 import logging
 import warnings
 from functools import partial
-from typing import TYPE_CHECKING, Iterable, Optional, Union
-
-import datasets
+from random import Random
+from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from random import Random
+    from collections.abc import Iterable, Sequence
+    from typing import Any, TypeVar
 
-    from lm_eval.api.task import ConfigurableTask, Task
+    _T = TypeVar("_T")
 
-eval_logger = logging.getLogger("lm-eval")
+eval_logger = logging.getLogger(__name__)
+
+
+def is_legacy_sampler(cls: type) -> bool:
+    """True for samplers written against the pre-0.4.13 sampler API.
+
+    Two sampler generations are in the wild. The current one only *picks*
+    documents -- ``sample(n, eval_doc=...)`` -- and ``Task.fewshot_context``
+    renders them. The older one renders the context itself, in ``get_context``
+    / ``get_chat_context``, and receives the evaluated document as the second
+    positional argument of ``sample``.
+
+    A sampler that overrides the rendering methods *and* whose ``sample`` has no
+    ``eval_doc`` parameter can only have been written against the old API: the
+    current pipeline would never call its rendering methods, and would call its
+    ``sample`` with a keyword it does not accept. Such a task is routed through
+    the legacy context builder so its prompts stay byte-for-byte what they were.
+
+    A sampler that implements both surfaces (``sample`` takes ``eval_doc`` *and*
+    ``get_context`` exists) is deliberately version-agnostic and is left on the
+    current path.
+    """
+    renders = (
+        cls.get_context is not ContextSampler.get_context
+        or cls.get_chat_context is not ContextSampler.get_chat_context
+    )
+    if not renders:
+        return False
+    try:
+        params = inspect.signature(cls.sample).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+        return True
+    return "eval_doc" not in params
 
 
 class ContextSampler:
     def __init__(
         self,
-        docs: list[dict],
-        task: Union["Task", "ConfigurableTask"],
-        fewshot_indices: Optional[Iterable] = None,
-        rnd: Optional["Random"] = None,
+        df: Sequence[dict[str, Any]] | None = None,
+        *,
+        rnd: int | None = None,
+        fewshot_indices: list[int] | None = None,
+        task: Any | None = None,
+        **kwargs,
     ) -> None:
-        self.rnd = rnd
-        if not self.rnd:
-            raise ValueError(
-                "A `random.Random` generator argument must be provided to `rnd` of FewShotSampler!"
-            )
+        self.rnd = Random(rnd) if not isinstance(rnd, Random) else rnd
+        self.df = df or []
+        self.fewshot_indices = fewshot_indices
+        self._loaded = False  # to iterate over fewshot_indices when needed
+        self._bind_task(task)
 
+    # ------------------------------------------------------------------
+    # Legacy sampler surface (lm-eval <= 0.4.9).
+    #
+    # Samplers of that generation build the context themselves and read the
+    # task off the sampler: ``self.task``, ``self.config``, the delimiters and
+    # the ``doc_to_*`` callables bound to ``fewshot_config``. Populating them
+    # here is what lets such a sampler keep working unchanged; a sampler that
+    # only picks documents never touches any of it.
+    # ------------------------------------------------------------------
+    def _bind_task(self, task: Any | None) -> None:
         self.task = task
-        self.config = task._config
+        if task is None:
+            self.config = None
+            self.target_delimiter = " "
+            self.fewshot_delimiter = "\n\n"
+            return
 
+        self.config = task._config
         self.target_delimiter = self.config.target_delimiter
         self.fewshot_delimiter = self.config.fewshot_delimiter
 
-        if (
-            self.config.fewshot_config is not None
-            and self.config.fewshot_config.get("doc_to_text", None) is not None
-        ):
-            self.doc_to_text = partial(
-                self.task.doc_to_text,
-                doc_to_text=self.config.fewshot_config.get("doc_to_text", None),
+        fs_cfg = self.config.fewshot_config
+        explicit = getattr(fs_cfg, "explicit", None)
+        if explicit is None:  # plain dict, e.g. a hand-built config
+            explicit = set(fs_cfg or ())
+        for field_name in ("doc_to_text", "doc_to_target", "doc_to_choice"):
+            task_fn = getattr(task, field_name)
+            # Only a template the task spelled out under `fewshot_config` pins the
+            # renderer. Binding the inherited task-level template here instead
+            # would freeze it, and a sampler that swaps `config.doc_to_text`
+            # while assembling shots -- the documented way to give the first
+            # shot the instruction and the rest none -- would stop taking effect.
+            override = fs_cfg.get(field_name, None) if field_name in explicit else None
+            setattr(
+                self,
+                field_name,
+                partial(task_fn, **{field_name: override}) if override else task_fn,
             )
-        else:
-            self.doc_to_text = self.task.doc_to_text
 
-        if (
-            self.config.fewshot_config is not None
-            and self.config.fewshot_config.get("doc_to_target", None) is not None
-        ):
-            self.doc_to_target = partial(
-                self.task.doc_to_target,
-                doc_to_target=self.config.fewshot_config.get("doc_to_target", None),
-            )
-        else:
-            self.doc_to_target = self.task.doc_to_target
+    @property
+    def docs(self):
+        """The fewshot pool under the name the old API used."""
+        return self.fewshot_docs()
 
-        if (
-            self.config.fewshot_config is not None
-            and self.config.fewshot_config.get("doc_to_choice", None) is not None
-        ):
-            self.doc_to_choice = partial(
-                self.task.doc_to_choice,
-                doc_to_choice=self.config.fewshot_config.get("doc_to_choice", None),
-            )
-        else:
-            self.doc_to_choice = self.task.doc_to_choice
+    @docs.setter
+    def docs(self, value):
+        self.df = value
+        self._loaded = True
 
-        self.docs = docs  # HF dataset split, provided by task._fewshot_docs()
-        if fewshot_indices:  # subset few-shot docs from
-            if not isinstance(self.docs, datasets.Dataset):
-                raise ValueError(
-                    "Got `fewshot_indices` but fewshot_docs are not a HF dataset. Don't use both `fewshot_indices` and a user-defined few-shot sample list simultaneously"
-                )
-            self.docs = self.docs.select(fewshot_indices)
-
-    def get_context(self, doc: dict, num_fewshot: int, gen_prefix: str = None):
-        # draw an extra fewshot sample if using same split as evaluating on
+    def get_context(self, doc: dict, num_fewshot: int, gen_prefix: str | None = None):
+        """Render the fewshot block as plain text (legacy sampler API)."""
         prefix = gen_prefix + " " if gen_prefix else ""
+        # draw an extra fewshot sample if using same split as evaluating on
         n_samples = (
             num_fewshot + 1
             if self.config.fewshot_split == self.config.test_split
             else num_fewshot
         )
-
-        # draw `n_samples` docs from fewshot_docs
         fewshotex = self.sample(n_samples)
 
         # get rid of the doc that's the one we're evaluating, if it's in the fewshot
-        # TODO: should we just stop people from using fewshot from same split as evaluating?
         selected_docs = [x for x in fewshotex if x != doc][:num_fewshot]
 
         labeled_examples = ""
@@ -102,7 +139,6 @@ class ContextSampler:
 
             if doc_target != "":
                 if self.target_delimiter.isspace() and str(doc_target)[0].isspace():
-                    # TODO: add logger warn once here.
                     warnings.warn(
                         "Both target_delimiter and target start with a space. This may cause issues.",
                         Warning,
@@ -126,22 +162,17 @@ class ContextSampler:
         doc: dict,
         num_fewshot: int,
         fewshot_as_multiturn: bool = False,
-        gen_prefix: Optional[str] = None,
+        gen_prefix: str | None = None,
     ):
-        # TODO: Do we need any other delimiter
+        """Render the fewshot block as chat turns (legacy sampler API)."""
         prefix = gen_prefix + " " if gen_prefix else ""
         chat_history = []
-        # draw an extra fewshot sample if using same split as evaluating on
         n_samples = (
             num_fewshot + 1
             if self.config.fewshot_split == self.config.test_split
             else num_fewshot
         )
-        # draw `n_samples` docs from fewshot_docs
         fewshotex = self.sample(n_samples)
-
-        # get rid of the doc that's the one we're evaluating, if it's in the fewshot
-        # TODO: should we just stop people from using fewshot from same split as evaluating?
         selected_docs = [x for x in fewshotex if x != doc][:num_fewshot]
 
         if fewshot_as_multiturn:
@@ -169,55 +200,109 @@ class ContextSampler:
                     }
                 )
         else:
-            # get fewshot context as one user turn
             chat_history.append(
                 {
                     "role": "user",
-                    "content": self.get_context(
-                        doc, num_fewshot, gen_prefix=gen_prefix
-                    ),
+                    "content": self.get_context(doc, num_fewshot, gen_prefix=gen_prefix),
                 }
             )
 
         return chat_history
 
-    def sample(self, n: int):
+    def sample(
+        self,
+        n: int,
+        eval_doc: dict[str, Any] | None = None,
+        df: Sequence[dict[str, Any]] | None = None,
+        **kwargs,
+    ) -> Sequence[dict[str, Any]]:
         """
-        Draw `n` samples from our fewshot docs. This method should be overridden by subclasses.
-        """
+        Sample n documents from the pool.
 
-        return self.rnd.sample(self.docs, n)
+        Args:
+            n: Number of documents to sample
+            eval_doc: Optional document to exclude from sampling
+            df: Optional list of documents to sample from
+
+        Returns:
+            List of sampled documents
+        """
+        assert n >= 0, "Error: number of samples requested must be >=0"
+        if n == 0:
+            return []
+
+        if df:
+            self.df = df
+
+        assert self.df, "Error: no documents available for sampling."
+        res = (
+            self.rnd.sample(self.fewshot_docs(), n)
+            if not eval_doc
+            else self.rm_eval_doc(
+                eval_doc, self.rnd.sample(self.fewshot_docs(), n + 1), n
+            )
+        )
+        assert len(res) == n, (
+            f"Error: number of fewshot samples returned ({len(res)}) not equal to number requested ({n})."
+        )
+        return res
+
+    def set_rnd(self, rnd: int | None):
+        self.rnd = Random(rnd) if not isinstance(rnd, Random) else rnd
+        return self
+
+    def replace_df(self, df: Sequence[dict[str, Any]]):
+        self.df = df
+        self._loaded = False
+        return self
+
+    def fewshot_docs(self):
+        """Return cached fewshot docs if available"""
+        if self._loaded:
+            return self.df
+        if self.fewshot_indices and self.df and not self._loaded:
+            self.df = [self.df[i] for i in self.fewshot_indices]
+        self._loaded = True
+        return list(self.df)
+
+    @staticmethod
+    def rm_eval_doc(doc: _T, _iter: Iterable[_T], n=None) -> Sequence[_T]:
+        return (
+            [x for x in _iter if x != doc]
+            if n is None
+            else [x for x in _iter if x != doc][:n]
+        )
 
 
 class FirstNSampler(ContextSampler):
-    def sample(self, n: int) -> None:
+    def sample(self, n: int, eval_doc=None, df=None, **kwargs):
         """
         Draw the first `n` samples in order from the specified split.
         Used for tasks with "canonical" ordered fewshot examples, such as MMLU and CMMLU.
         """
-        assert n <= len(self.docs), (
-            f"Error: number of fewshot samples requested exceeds the {len(self.docs)} that are available."
+        pool = self.rm_eval_doc(eval_doc, self.df) if eval_doc is not None else self.df
+        assert n <= len(pool), (
+            f"Error: number of fewshot samples requested exceeds the {len(pool)} that are available."
         )
-        return self.docs[:n]
+        return pool[:n]
 
 
 class BalancedSampler(ContextSampler):
-    def sample(self, n: int) -> None:
+    def sample(self, n: int, eval_doc=None, df=None, **kwargs):
         """
         TODO: this should return approximately class-balanced samples from our fewshot examples.
         TODO: what order should they be in? maybe random?
         """
 
-        pass
+        raise NotImplementedError
 
 
 class ManualSampler(ContextSampler):
-    def sample(self, n: int) -> None:
-        """ """
-        pass
+    def sample(self, n: int, eval_doc=None, df=None, **kwargs):
+        raise NotImplementedError
 
 
-SAMPLER_REGISTRY = {
+SAMPLER_REGISTRY: dict[str, type[ContextSampler]] = {
     "default": ContextSampler,
     "first_n": FirstNSampler,
 }
@@ -226,7 +311,7 @@ SAMPLER_REGISTRY = {
 def get_sampler(name: str):
     try:
         return SAMPLER_REGISTRY[name]
-    except KeyError:
-        raise ValueError(
+    except KeyError as e:
+        raise KeyError(
             f"Attempted to use contextsampler '{name}', but no sampling strategy for this name found! Supported model names: {', '.join(SAMPLER_REGISTRY.keys())}"
-        )
+        ) from e

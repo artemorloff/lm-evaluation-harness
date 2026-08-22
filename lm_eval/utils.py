@@ -36,6 +36,17 @@ HIGHER_IS_BETTER_SYMBOLS = {
 _YAML_MODULE_CACHE: dict[Path, ModuleType] = {}
 _YAML_MODULE_CACHE_LOCK = threading.RLock()
 
+# Track whether logging has been configured to avoid duplicate handlers
+_LOGGING_CONFIGURED = False
+
+
+class _LMEvalFormatter(logging.Formatter):
+    """Formatter that strips 'lm_eval.' prefix from logger names for cleaner output."""
+
+    def format(self, record):
+        record.short_name = record.name.removeprefix("lm_eval.")
+        return super().format(record)
+
 
 def is_torch_available() -> bool:
     return importlib.util.find_spec("torch") is not None
@@ -63,43 +74,64 @@ def wrap_text(string: str, width: int = 140, **kwargs) -> str | None:
 
 
 def setup_logging(verbosity=logging.INFO):
-    # Configure the root logger
-    class CustomFormatter(logging.Formatter):
-        def format(self, record):
-            record.name = record.name.removeprefix("lm_eval.")
-            return super().format(record)
+    """Configure logging for lm_eval.
 
-    formatter = CustomFormatter(
-        "%(asctime)s %(levelname)-8s [%(name)s:%(lineno)d] %(message)s",
-        datefmt="%Y-%m-%d:%H:%M:%S",
-    )
+    Args:
+        verbosity: Default log level. Can be overridden by LMEVAL_LOG_LEVEL env var.
+    """
+    global _LOGGING_CONFIGURED
 
-    log_level = os.environ.get("LMEVAL_LOG_LEVEL", verbosity) or verbosity
-
-    level_map = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-        "CRITICAL": logging.CRITICAL,
-    }
-
-    log_level = level_map.get(str(log_level).upper(), logging.INFO)
-
-    if not logging.root.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
-
-        root_logger = logging.getLogger()
-        root_logger.addHandler(handler)
-        root_logger.setLevel(log_level)
-
-        if log_level == logging.DEBUG:
-            third_party_loggers = ["urllib3", "filelock", "fsspec"]
-            for logger_name in third_party_loggers:
-                logging.getLogger(logger_name).setLevel(logging.INFO)
+    # Determine log level from env or argument
+    env_level = os.environ.get("LMEVAL_LOG_LEVEL", "").upper()
+    if env_level:
+        log_level = logging.getLevelName(env_level)
+        # getLevelName returns the string back if invalid
+        if not isinstance(log_level, int):
+            log_level = verbosity
     else:
-        logging.getLogger().setLevel(log_level)
+        log_level = verbosity
+
+    lm_eval_logger = logging.getLogger("lm_eval")
+    lm_eval_logger.setLevel(log_level)
+
+    if not _LOGGING_CONFIGURED:
+        _LOGGING_CONFIGURED = True
+
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            _LMEvalFormatter(
+                "%(asctime)s %(levelname)-8s [%(short_name)s:%(lineno)d] %(message)s",
+                datefmt="%Y-%m-%d:%H:%M:%S",
+            )
+        )
+        lm_eval_logger.addHandler(handler)
+
+        # Don't propagate to root to avoid duplicate logs if root is also configured
+        lm_eval_logger.propagate = False
+
+        # Quiet noisy third-party loggers in debug mode
+        if log_level == logging.DEBUG:
+            for logger_name in ("urllib3", "filelock", "fsspec"):
+                logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+@functools.cache
+def warning_once(logger: logging.Logger, msg: str, *args):
+    """Log a warning message only once per unique message."""
+    logger.warning(msg, *args)
+
+
+@functools.cache
+def info_once(logger: logging.Logger, msg: str, *args):
+    """Log an info message only once per unique message."""
+    logger.info(msg, *args)
+
+
+def maybe_warn(msg: str, verbose: bool = True):
+    """Log a warning message only when verbose is True, otherwise noop."""
+    if verbose:
+        logger = logging.getLogger(__name__)
+        logger.warning(msg)
 
 
 def hash_string(string: str) -> str:
@@ -130,12 +162,42 @@ def escaped_split(text, sep_char, maxsplit=-1):
 
 
 def handle_arg_string(arg):
-    if arg.lower() == "true":
+    """Attempt to infer and cast the type of a single argument value string.
+
+    Supports:
+    - Booleans: "true"/"false" (case-insensitive)
+    - None: "None" / "none"
+    - Explicit strings: values wrapped in matching quotes are preserved as-is
+      (e.g. ``"123"`` or ``'hello'`` -> str)
+    - Integers: optional sign, digits only (e.g. "42", "-1")
+    - Floats: anything ``float()`` accepts, including scientific notation
+    - Fallback: return as string unchanged
+    """
+    # Strip surrounding whitespace
+    arg = arg.strip()
+
+    # Explicit quoting -> always a string
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in ("'", '"'):
+        return arg[1:-1]
+
+    lower = arg.lower()
+    if lower == "true":
         return True
-    elif arg.lower() == "false":
+    if lower == "false":
         return False
-    elif arg.isnumeric():
-        return int(arg)
+    if lower == "none":
+        return None
+
+    # Try integer first (supports negative numbers unlike str.isnumeric)
+    try:
+        # Guard against strings like "1e3" being parsed as int via float path
+        # Only pure digit strings (with optional leading sign) should become int
+        if arg.lstrip("+-").isdigit() and arg not in ("", "+", "-"):
+            return int(arg)
+    except ValueError:
+        pass
+
+    # Try float (handles decimals, scientific notation, inf, etc.)
     try:
         return float(arg)
     except ValueError:
@@ -385,14 +447,44 @@ class Reorderer:
         return res
 
 
+def _build_hierarchy_info(
+    group_subtasks: dict[str, list[str]], available_keys: set[str]
+) -> tuple[dict[str, int], list[str]]:
+    """Build depth map and hierarchical key ordering from group_subtasks.
+
+    Uses a tree-walk approach over group_subtasks for ordering.
+
+    Returns:
+        (depth_map, ordered_keys) — depths for indentation, keys in display order
+    """
+    depth_map: dict[str, int] = {}
+    ordered: list[str] = []
+
+    def visit(name: str, depth: int):
+        depth_map[name] = depth
+        if name in available_keys:
+            ordered.append(name)
+        for child in sorted(group_subtasks.get(name, [])):
+            visit(child, depth + 1)
+
+    all_children = {c for children in group_subtasks.values() for c in children}
+    for name in sorted(group_subtasks):
+        if name not in all_children:
+            visit(name, 0)
+
+    # Add remaining keys not in any hierarchy (sorted for determinism)
+    for key in sorted(available_keys):
+        if key not in depth_map:
+            ordered.append(key)
+
+    return depth_map, ordered
+
+
 def make_table(result_dict, column: str = "results", sort_results: bool = False):
     """Generate table of results."""
     from pytablewriter import LatexTableWriter, MarkdownTableWriter
 
-    if column == "results":
-        column_name = "Tasks"
-    elif column == "groups":
-        column_name = "Groups"
+    column_name = "Groups" if column == "groups" else "Tasks"
 
     all_headers = [
         column_name,
@@ -413,20 +505,37 @@ def make_table(result_dict, column: str = "results", sort_results: bool = False)
 
     values = []
 
-    keys = result_dict[column].keys()
-    if sort_results:
+    # Build depth map and hierarchical key ordering from group_subtasks
+    group_subtasks = result_dict.get("group_subtasks", {})
+    depth_map, hierarchical_keys = _build_hierarchy_info(
+        group_subtasks, set(result_dict[column].keys())
+    )
+
+    if sort_results:  # noqa: SIM108
         # sort entries alphabetically by task or group name.
         # NOTE: we default here to false, because order matters for multi-level table printing a la mmlu.
         # sorting here would mess that up
-        keys = sorted(keys)
+        keys = sorted(result_dict[column].keys())
+    else:
+        keys = hierarchical_keys
     for k in keys:
-        dic = result_dict[column][k]
+        dic = dict(result_dict[column][k])  # copy — don't mutate original
         version = result_dict["versions"].get(k, "    N/A")
         n = str(result_dict.get("n-shot", " ").get(k, " "))
         higher_is_better = result_dict.get("higher_is_better", {}).get(k, {})
 
-        if "alias" in dic:
-            k = dic.pop("alias")
+        display_name = dic.pop("alias", k)
+        ## alias takes care of name, and we don't print sample_len
+        dic.pop("name", None)
+        dic.pop("sample_len", None)
+        dic.pop("sample_count", None)
+
+        # Add indentation based on hierarchy depth
+        depth = depth_map.get(k, 0)
+        if depth > 0:
+            display_name = " " * depth + "- " + display_name
+
+        k = display_name
 
         metric_items = dic.items()
         metric_items = sorted(metric_items)
@@ -510,56 +619,6 @@ def import_function(loader: yaml.Loader, node, yaml_path: Path):
 
     function = getattr(module, function_name)
     return function
-
-
-def load_yaml_config(yaml_path=None, yaml_config=None, yaml_dir=None, mode="full"):
-    if mode == "simple":
-        constructor_fn = ignore_constructor
-    elif mode == "full":
-        if yaml_path is None:
-            raise ValueError("yaml_path must be provided if mode is 'full'.")
-        # Attach yaml_path to the import function so that it can be used later
-        constructor_fn = functools.partial(import_function, yaml_path=Path(yaml_path))
-
-    loader = yaml.CLoader if yaml.__with_libyaml__ else yaml.FullLoader
-    # Add the import_function constructor to the YAML loader
-    yaml.add_constructor("!function", constructor_fn, Loader=loader)
-    if yaml_config is None:
-        with open(yaml_path, "rb") as file:
-            yaml_config = yaml.load(file, Loader=loader)
-
-    if yaml_dir is None:
-        yaml_dir = os.path.dirname(yaml_path)
-
-    assert yaml_dir is not None
-
-    if "include" in yaml_config:
-        include_path = yaml_config["include"]
-        del yaml_config["include"]
-
-        if isinstance(include_path, str):
-            include_path = [include_path]
-
-        # Load from the last one first
-        include_path.reverse()
-        final_yaml_config = {}
-        for path in include_path:
-            # Assumes that path is a full path.
-            # If not found, assume the included yaml
-            # is in the same dir as the original yaml
-            if not os.path.isfile(path):
-                path = os.path.join(yaml_dir, path)
-
-            try:
-                included_yaml_config = load_yaml_config(yaml_path=path, mode=mode)
-                final_yaml_config.update(included_yaml_config)
-            except Exception as ex:
-                # If failed to load, ignore
-                raise ex
-
-        final_yaml_config.update(yaml_config)
-        return final_yaml_config
-    return yaml_config
 
 
 def regex_replace(string, pattern, repl, count: int = 0):
@@ -871,3 +930,11 @@ def set_torch_seed(seed: int):
         import torch
 
         torch.manual_seed(seed)
+
+
+def random_name_id() -> str:
+    """Generate a random 8-character alphanumeric ID."""
+    import random
+    import string
+
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=8))

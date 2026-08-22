@@ -38,7 +38,7 @@ def mean(arr):
 
 @register_aggregation("median")
 def median(arr):
-    return arr[len(arr) // 2]
+    return sorted(arr)[len(arr) // 2]
 
 
 # Certain metrics must be calculated across all documents in a benchmark.
@@ -332,6 +332,16 @@ def rouge_fn(**kwargs):
     aggregation="perplexity",
 )
 def perplexity_fn(items):  # This is a passthrough function
+    return items
+
+
+@register_metric(
+    metric="likelihood",
+    higher_is_better=True,
+    output_type="multiple_choice",
+    aggregation="mean",
+)
+def likelihood_fn(items):  # This is a passthrough function
     return items
 
 
